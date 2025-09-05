@@ -256,7 +256,15 @@ class IqiyiScraper(BaseScraper):
         self.reg_video_info = re.compile(r'"videoInfo":(\{.+?\}),')
         self.cookies = {"pgv_pvid": "40b67e3b06027f3d","video_platform": "2","vversion_name": "8.2.95","video_bucketid": "4","video_omgid": "0a1ff6bc9407c0b1cff86ee5d359614d"}
         # 实体引用匹配正则
-        self.client: Optional[httpx.AsyncClient] = None
+        self.client = httpx.AsyncClient(
+            headers={
+                "User-Agent": self.mobile_user_agent,
+                "Referer": "https://www.iqiyi.com/",
+            },
+            cookies=self.cookies,
+            timeout=30.0, # 增加默认超时时间
+            follow_redirects=True
+        )
         self.entity_pattern = re.compile(r'&#[xX]?[0-9a-fA-F]+;')
 
         # XML 1.0规范允许的字符编码范围
@@ -268,23 +276,13 @@ class IqiyiScraper(BaseScraper):
             list(range(0xE000, 0xFDCF + 1)) +
             list(range(0xFDE0, 0xFFFD + 1))
          )
-
-    async def _ensure_client(self):
-        """Ensures the httpx client is initialized, with proxy support."""
-        if self.client is None:
-            headers = {
-                "User-Agent": self.mobile_user_agent,
-                "Referer": "https://www.iqiyi.com/",
-            }
-            # 修正：使用基类中的 _create_client 方法来创建客户端，以支持代理
-            self.client = await self._create_client(
-                headers=headers, cookies=self.cookies, timeout=30.0, follow_redirects=True
-            )
+        # 新增：为弹幕下载添加并发控制器
+        self.danmaku_semaphore = asyncio.Semaphore(5)
 
     async def get_episode_blacklist_pattern(self) -> Optional[re.Pattern]:
         """
         获取并编译用于过滤分集的正则表达式。
-        此方法现在只使用数据库中配置的规则，如果规则为空，则不进行过滤。
+        此方法覆盖了基类中的方法，以确保对该源的正确回退逻辑。
         """
         # 1. 构造该源特定的配置键，确保与数据库键名一致
         provider_blacklist_key = f"{self.provider_name}_episode_blacklist_regex"
@@ -292,22 +290,29 @@ class IqiyiScraper(BaseScraper):
         # 2. 从数据库动态获取用户自定义规则
         custom_blacklist_str = await self.config_manager.get(provider_blacklist_key)
 
-        # 3. 仅当用户配置了非空的规则时才进行过滤
+        final_blacklist_str = None
+        # 3. 优先使用用户自定义的、非空的规则
         if custom_blacklist_str and custom_blacklist_str.strip():
             self.logger.info(f"正在为 '{self.provider_name}' 使用数据库中的自定义分集黑名单。")
-            try:
-                return re.compile(custom_blacklist_str, re.IGNORECASE)
-            except re.error as e:
-                self.logger.error(f"编译 '{self.provider_name}' 的分集黑名单时出错: {e}。规则: '{custom_blacklist_str}'")
+            final_blacklist_str = custom_blacklist_str
+        # 4. 如果没有自定义规则，则回退到代码中内置的默认规则
+        elif self._PROVIDER_SPECIFIC_BLACKLIST_DEFAULT:
+            self.logger.info(f"正在为 '{self.provider_name}' 使用代码中内置的默认分集黑名单。")
+            final_blacklist_str = self._PROVIDER_SPECIFIC_BLACKLIST_DEFAULT
         
-        # 4. 如果规则为空或未配置，则不进行过滤
+        if final_blacklist_str:
+            try:
+                # 5. 编译正则表达式并返回
+                return re.compile(final_blacklist_str, re.IGNORECASE)
+            except re.error as e:
+                self.logger.error(f"编译 '{self.provider_name}' 的分集黑名单时出错: {e}。规则: '{final_blacklist_str}'")
+        
+        # 6. 如果没有任何规则，返回 None
         return None
 
     async def close(self):
         """关闭HTTP客户端"""
-        if self.client:
-            await self.client.aclose()
-            self.client = None
+        await self.client.aclose()
 
     def _xor_operation(self, num: int) -> int:
         """实现JavaScript中的异或运算函数"""
@@ -361,8 +366,6 @@ class IqiyiScraper(BaseScraper):
         return md5_hash
 
     async def _request(self, method: str, url: str, **kwargs) -> httpx.Response: # type: ignore
-        await self._ensure_client()
-        assert self.client is not None
         return await self.client.request(method, url, **kwargs)
 
     async def _request_with_retry(self, method: str, url: str, retries: int = 3, **kwargs) -> httpx.Response:
@@ -1130,115 +1133,109 @@ class IqiyiScraper(BaseScraper):
 
     async def _get_danmu_content_by_mat(self, tv_id: str, mat: int) -> List[IqiyiComment]:
         """根据tv_id和分段号获取弹幕内容"""
-        if len(tv_id) < 4:
-            self.logger.warning("tv_id长度不足4位，返回空")
+        # 使用信号量控制并发
+        async with self.danmaku_semaphore:
+            if len(tv_id) < 4:
+                self.logger.warning("tv_id长度不足4位，返回空")
+                return []
+
+            # 构建弹幕URL
+            s1 = tv_id[-4:-2]
+            s2 = tv_id[-2:]
+            url = f"https://cmts.iqiyi.com/bullet/{s1}/{s2}/{tv_id}_300_{mat}.z"
+            self.logger.debug(f"URL构建: s1={s1}, s2={s2}, 完整URL={url}")
+
+            try:
+                response = await self._request_with_retry("GET", url)
+                if response.status_code == 404:
+                    self.logger.info(f"未找到分段 {mat}（404）")
+                    return []
+                response.raise_for_status()
+
+                decompressed_data = zlib.decompress(response.content)
+                if len(decompressed_data) < 10:
+                    self.logger.warning("解压后数据为空或过小")
+                    return []
+
+                encoding_result = chardet.detect(decompressed_data)
+                encoding = encoding_result['encoding'] or 'utf-8'
+                if encoding.lower() == 'utf-8' and decompressed_data.startswith(b'\xef\xbb\xbf'):
+                    decompressed_data = decompressed_data[3:]
+                xml_str = decompressed_data.decode(encoding, errors='replace')
+                xml_str = self._filter_entities(xml_str)
+                if len(xml_str) < 10:
+                    self.logger.warning("过滤后XML内容为空或过小")
+                    return []
+
+                parser = etree.XMLParser(recover=True)
+                root = etree.fromstring(xml_str.encode('utf-8'), parser=parser)
+                
+                comments = []
+                for item in root.xpath('/danmu/data/entry/list/bulletInfo'):
+                    content = item.findtext('content')
+                    show_time = item.findtext('showTime')
+                    if not (content and show_time):
+                        continue
+                    comments.append(IqiyiComment(
+                        contentId=item.findtext('contentId', default='0'),
+                        content=content,
+                        showTime=int(show_time),
+                        color=item.findtext('color', default='ffffff'),
+                        userInfo=IqiyiUserInfo(uid=item.findtext('userInfo/uid'))
+                        if item.findtext('userInfo/uid') else None
+                    ))
+                return comments
+
+            except zlib.error:
+                self.logger.warning(f"分段 {mat} 解压失败")
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 404:
+                    self.logger.error(f"处理弹幕分段 {mat} 时发生HTTP错误: {e}")
+            except (etree.XMLSyntaxError, Exception) as e:
+                self.logger.error(f"处理弹幕分段 {mat} 时发生未知错误", exc_info=True)
+            
             return []
 
-        # 构建弹幕URL
-        s1 = tv_id[-4:-2]
-        s2 = tv_id[-2:]
-        # 修正：将弹幕服务器地址从 http 改为 https，以修复404错误。
-        url = f"https://cmts.iqiyi.com/bullet/{s1}/{s2}/{tv_id}_300_{mat}.z"
-        self.logger.debug(f"URL构建: s1={s1}, s2={s2}, 完整URL={url}")
-
-        try:
-            # 发送请求
-            response = await self._request_with_retry("GET", url)
-
-            # 处理状态码
-            if response.status_code == 404:
-                self.logger.info(f"未找到分段 {mat}（404）")
-                return []
-            response.raise_for_status()
-
-            # 解压缩数据
-            decompressed_data = zlib.decompress(response.content)
-
-            # 验证解压后的数据是否为空
-            if len(decompressed_data) < 10:
-                self.logger.warning("解压后数据为空或过小")
-                return []
-
-            # 检测编码并处理BOM头
-            encoding_result = chardet.detect(decompressed_data)
-            encoding = encoding_result['encoding'] or 'utf-8'
-
-            if encoding.lower() == 'utf-8' and decompressed_data.startswith(b'\xef\xbb\xbf'):
-                decompressed_data = decompressed_data[3:]
-                self.logger.debug("已移除UTF-8 BOM头")
-
-            # 解码为字符串
-            xml_str = decompressed_data.decode(encoding, errors='replace')
-
-            # 过滤无效内容
-            xml_str = self._filter_entities(xml_str)
-            if len(xml_str) < 10:
-                self.logger.warning("过滤后XML内容为空或过小")
-                return []
-
-            # 关键修复1：使用XML专用解析器，保留原始结构
-            parser = etree.XMLParser(recover=True)  # 容错的XML解析器，而非HTML解析器
-            try:
-                root = etree.fromstring(xml_str.encode('utf-8'), parser=parser)
-            except etree.XMLSyntaxError as e:
-                self._log_error_context(xml_str, e.lineno, e.position[1])
-                raise
-
-            # 提取弹幕信息
-            comments = []
-            # 遍历绝对路径下的bulletInfo节点
-            for item in root.xpath('/danmu/data/entry/list/bulletInfo'):
-                content = item.findtext('content')
-                show_time = item.findtext('showTime')
-
-                if not (content and show_time):
-                    self.logger.debug("跳过缺少content或showTime的弹幕")
-                    continue
-
-                comments.append(IqiyiComment(
-                    contentId=item.findtext('contentId', default='0'),
-                    content=content,
-                    showTime=int(show_time),
-                    color=item.findtext('color', default='ffffff'),
-                    userInfo=IqiyiUserInfo(uid=item.findtext('userInfo/uid'))
-                    if item.findtext('userInfo/uid') else None
-                ))
-
-            return comments
-
-        except zlib.error:
-            self.logger.warning("解压失败（可能是文件损坏）")
-        except (etree.XMLSyntaxError, Exception) as e:
-            if isinstance(e, etree.XMLSyntaxError):
-                self._log_error_context(xml_str, e.lineno, e.position[1])
-            self.logger.error(f"处理弹幕分段时发生错误", exc_info=True)
-
-        return []
-
     async def get_comments(self, episode_id: str, progress_callback: Optional[Callable] = None) -> List[dict]:
-        tv_id = episode_id # For iqiyi, episodeId is tvId
+        tv_id = episode_id
         all_comments = []
         
-        # 优化：先获取视频总时长，以确定需要请求多少个分段
         duration = await self._get_duration_for_tvid(tv_id)
         if duration and duration > 0:
             total_mats = (duration // 300) + 1
             self.logger.info(f"爱奇艺: 视频时长 {duration}s, 预计弹幕分段数: {total_mats}")
         else:
-            total_mats = 100 # 如果获取时长失败，回退到旧的固定循环次数
+            total_mats = 100
             self.logger.warning(f"爱奇艺: 未能获取视频时长，将使用默认循环次数 ({total_mats})。")
 
-        for mat in range(1, total_mats + 1):
-            if progress_callback:
-                progress = int((mat / total_mats) * 100) if total_mats > 0 else 100
-                await progress_callback(progress, f"正在获取第 {mat}/{total_mats} 分段")
+        if total_mats == 0:
+            return []
 
-            comments_in_mat = await self._get_danmu_content_by_mat(tv_id, mat)
+        # 创建所有并发任务
+        tasks = [self._get_danmu_content_by_mat(tv_id, mat) for mat in range(1, total_mats + 1)]
+        
+        completed_count = 0
+        has_failed_sequentially = False
+        
+        # 使用 as_completed 处理任务
+        for future in asyncio.as_completed(tasks):
+            comments_in_mat = await future
+            
+            # 爱奇艺的弹幕是连续的，如果一个分段获取失败（返回空），后续的大概率也不存在
+            # 为了避免不必要的请求，我们在这里进行检查
             if not comments_in_mat:
-                break
+                # 记录一下是哪个任务失败，但不需要立即停止所有
+                # 我们可以设置一个标志位
+                has_failed_sequentially = True
+            
+            # 即使有失败的，我们依然收集成功的结果
             all_comments.extend(comments_in_mat)
-            await asyncio.sleep(0.2) # Be nice to the server
 
+            completed_count += 1
+            if progress_callback:
+                progress = int((completed_count / total_mats) * 100)
+                await progress_callback(progress, f"已处理分段 {completed_count}/{total_mats}")
+        
         if progress_callback:
             await progress_callback(100, "弹幕整合完成")
 

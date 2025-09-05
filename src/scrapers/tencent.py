@@ -222,23 +222,15 @@ class TencentScraper(BaseScraper):
 
         # httpx.AsyncClient 是 Python 中功能强大的异步HTTP客户端，等同于 C# 中的 HttpClient
         # 此处通过 cookies 参数传入字典，httpx 会自动将其格式化为正确的 Cookie 请求头，效果与C#代码一致
-        self.client: Optional[httpx.AsyncClient] = None
+        self.client = httpx.AsyncClient(headers=self.base_headers, cookies=self.cookies, timeout=20.0)
 
         # 新增：用于分集获取的API端点
         self.episodes_api_url = "https://pbaccess.video.qq.com/trpc.universal_backend_service.page_server_rpc.PageServer/GetPageData?video_appid=3000010&vversion_name=8.2.96&vversion_platform=2"
-
-    async def _ensure_client(self):
-        """Ensures the httpx client is initialized, with proxy support."""
-        if self.client is None:
-            # 修正：使用基类中的 _create_client 方法来创建客户端，以支持代理
-            self.client = await self._create_client(
-                headers=self.base_headers, cookies=self.cookies, timeout=20.0
-            )
-
-    async def _request(self, method: str, url: str, **kwargs) -> httpx.Response:
-        await self._ensure_client()
-        assert self.client is not None
-        return await self.client.request(method, url, **kwargs)
+        
+        # --- 为并发下载弹幕设置信号量，限制同时进行的请求数量 ---
+        # 这是一个重要的实践，可以防止因请求过快被服务器屏蔽
+        # 5 是一个非常安全且依然高效的并发数
+        self.danmaku_semaphore = asyncio.Semaphore(5)
 
     # Porting TITLE_MAPPING from JS
     _TITLE_MAPPING = {
@@ -257,9 +249,7 @@ class TencentScraper(BaseScraper):
 
     async def close(self):
         """关闭HTTP客户端"""
-        if self.client:
-            await self.client.aclose()
-            self.client = None
+        await self.client.aclose()
 
     def _filter_search_item(self, item: TencentSearchItem, keyword: str) -> Optional[models.ProviderSearchInfo]:
         """
@@ -353,7 +343,7 @@ class TencentScraper(BaseScraper):
         results = []
         try:
             self.logger.info(f"Tencent (桌面API): 正在搜索 '{keyword}'...")
-            response = await self._request("POST", url, json=payload)
+            response = await self.client.post(url, json=payload)
             if await self._should_log_responses():
                 scraper_responses_logger.debug(f"Tencent Desktop Search Response (keyword='{keyword}'): {response.text}")
 
@@ -384,7 +374,7 @@ class TencentScraper(BaseScraper):
         results = []
         try:
             self.logger.info(f"Tencent (移动API): 正在搜索 '{keyword}'...")
-            response = await self._request("POST", url, json=payload, headers=headers)
+            response = await self.client.post(url, json=payload, headers=headers)
             if await self._should_log_responses():
                 scraper_responses_logger.debug(f"Tencent Mobile Search Response (keyword='{keyword}'): {response.text}")
 
@@ -417,9 +407,9 @@ class TencentScraper(BaseScraper):
         results = []
         try:
             self.logger.info(f"Tencent (MultiTerminal API): 正在搜索 '{keyword}'...")
-            # 修正：为这个特殊的API调用也应用代理设置
-            proxy_to_use = await self._get_proxy_for_provider()
-            async with httpx.AsyncClient(headers=headers, cookies=self.multiterminal_cookies, timeout=20.0, proxy=proxy_to_use) as client:
+            # 使用独立的 httpx.AsyncClient 或更新现有客户端的 headers/cookies
+            # 为了隔离，这里创建一个新的临时客户端
+            async with httpx.AsyncClient(headers=headers, cookies=self.multiterminal_cookies, timeout=20.0) as client:
                 response = await client.post(url, json=payload)
 
             if await self._should_log_responses():
@@ -522,7 +512,7 @@ class TencentScraper(BaseScraper):
         cid = cid_match.group(1)
         
         try:
-            response = await self._request("GET", url)
+            response = await self.client.get(url)
             response.raise_for_status()
             html_content = response.text
 
@@ -563,7 +553,7 @@ class TencentScraper(BaseScraper):
             }
         }
         try:
-            response = await self._request("POST", self.episodes_api_url, json=payload)
+            response = await self.client.post(self.episodes_api_url, json=payload)
             response.raise_for_status()
             result = TencentPageResult.model_validate(response.json())
 
@@ -582,6 +572,7 @@ class TencentScraper(BaseScraper):
         
         self.logger.warning(f"通过API未能获取到电影 (cid={cid}) 的 vid。")
         return None
+        
     async def get_episodes(self, media_id: str, target_episode_index: Optional[int] = None, db_media_type: Optional[str] = None) -> List[models.ProviderEpisodeInfo]:
         """
         获取分集列表，优先使用新的“分页卡片”策略。
@@ -599,7 +590,7 @@ class TencentScraper(BaseScraper):
                 self.logger.warning(f"API获取电影vid失败，回退到HTML页面解析 (cid={media_id})。")
                 try:
                     cover_url = f"https://v.qq.com/x/cover/{media_id}.html"
-                    response = await self._request("GET", cover_url)
+                    response = await self.client.get(cover_url)
                     response.raise_for_status()
                     html_content = response.text
 
@@ -697,7 +688,7 @@ class TencentScraper(BaseScraper):
                 "detail_page_type": "1"
             }
         }
-        response = await self._request("POST", self.episodes_api_url, json=payload)
+        response = await self.client.post(self.episodes_api_url, json=payload)
         response.raise_for_status()
         result = TencentPageResult.model_validate(response.json())
 
@@ -789,7 +780,7 @@ class TencentScraper(BaseScraper):
                 }
             }
             try:
-                response = await self._request("POST", self.episodes_api_url, json=payload)
+                response = await self.client.post(self.episodes_api_url, json=payload)
                 if await self._should_log_responses():
                     scraper_responses_logger.debug(f"Tencent Paginated Episodes Response (cid={cid}, page={page_num}): {response.text}")
                 response.raise_for_status()
@@ -968,70 +959,90 @@ class TencentScraper(BaseScraper):
 
         return final_episodes
 
-    async def _internal_get_comments(self, vid: str, progress_callback: Optional[Callable] = None) -> List[TencentComment]:
+    async def _fetch_segment_comments(self, vid: str, segment_name: str) -> List[TencentComment]:
         """
-        获取指定vid的所有弹幕。
-        分两步：先获取弹幕分段索引，再逐个获取分段内容。
+        【新增】并发获取单个弹幕分段的内容。
+        使用信号量来控制并发数量。
         """
-        all_comments: List[TencentComment] = []
-        # 1. 获取弹幕分段索引
-        index_url = f"https://dm.video.qq.com/barrage/base/{vid}"
-        try:
-            response = await self._request("GET", index_url)
-            if await self._should_log_responses():
-                scraper_responses_logger.debug(f"Tencent Danmaku Index Response (vid={vid}): {response.text}")
-            response.raise_for_status()
-            index_data = response.json()
-            segment_index = index_data.get("segment_index", {})
-            if not segment_index: # 如果视频没有弹幕，这里会是空的
-                self.logger.info(f"vid='{vid}' 没有找到弹幕分段索引。")
-                return []
-        except Exception as e:
-            self.logger.error(f"获取弹幕索引失败 (vid={vid}): {e}", exc_info=True)
-            return []
-
-        # 2. 遍历分段，获取弹幕内容
-        total_segments = len(segment_index)
-        self.logger.debug(f"为 vid='{vid}' 找到 {total_segments} 个弹幕分段，开始获取...")
-        if progress_callback:
-            await progress_callback(5, f"找到 {total_segments} 个弹幕分段")
-
-        # 与C#代码不同，这里我们直接遍历所有分段以获取全部弹幕，而不是抽样
-        # 按key（时间戳）排序，确保弹幕顺序正确
-        sorted_keys = sorted(segment_index.keys(), key=int)
-        for i, key in enumerate(sorted_keys):
-            segment = segment_index[key]
-            segment_name = segment.get("segment_name")
-            if not segment_name:
-                continue
-            
-            if progress_callback:
-                # 5%用于获取索引，90%用于下载，5%用于格式化
-                progress = 5 + int(((i + 1) / total_segments) * 90)
-                await progress_callback(progress, f"正在下载分段 {i+1}/{total_segments}")
-
-            segment_url = f"https://dm.video.qq.com/barrage/segment/{vid}/{segment_name}"
+        segment_url = f"https://dm.video.qq.com/barrage/segment/{vid}/{segment_name}"
+        # 在执行请求前，先异步获取一个信号量“令牌”
+        async with self.danmaku_semaphore:
             try:
-                response = await self._request("GET", segment_url)
+                response = await self.client.get(segment_url)
                 if await self._should_log_responses():
                     scraper_responses_logger.debug(f"Tencent Danmaku Segment Response (vid={vid}, segment={segment_name}): status={response.status_code}")
                 response.raise_for_status()
                 comment_data = response.json()
                 
                 barrage_list = comment_data.get("barrage_list", [])
+                valid_comments = []
                 for comment_item in barrage_list:
                     try:
-                        all_comments.append(TencentComment.model_validate(comment_item))
+                        valid_comments.append(TencentComment.model_validate(comment_item))
                     except ValidationError as e:
-                        # 腾讯的弹幕列表里有时会混入非弹幕数据（如广告、推荐等），这些数据结构不同
-                        # 我们在这里捕获验证错误，记录并跳过这些无效数据，以保证程序健壮性
                         self.logger.warning(f"跳过一个无效的弹幕项目，因为它不符合预期的格式。原始数据: {comment_item}, 错误: {e}")
                 
-                await asyncio.sleep(0.2) # 礼貌性等待
+                # 增加一个微小的随机延迟，使请求模式不那么规律
+                await asyncio.sleep(0.1 + (0.2 * hash(segment_name) % 100 / 100))
+                return valid_comments
 
             except Exception as e:
-                self.logger.error(f"获取分段 {segment_name} 失败 (vid={vid}): {e}", exc_info=True)
+                # 如果单个分段下载失败，只记录错误，不中断整个过程
+                self.logger.error(f"获取分段 {segment_name} 失败 (vid={vid}): {e}")
+                return [] # 返回空列表表示此分段失败
+
+    async def _internal_get_comments(self, vid: str, progress_callback: Optional[Callable] = None) -> List[TencentComment]:
+        """
+        【重写】获取指定vid的所有弹幕。
+        采用并发方式下载所有弹幕分段以大幅提升速度。
+        """
+        all_comments: List[TencentComment] = []
+        # 1. 获取弹幕分段索引（这一步仍然是单次的）
+        index_url = f"https://dm.video.qq.com/barrage/base/{vid}"
+        try:
+            response = await self.client.get(index_url)
+            if await self._should_log_responses():
+                scraper_responses_logger.debug(f"Tencent Danmaku Index Response (vid={vid}): {response.text}")
+            response.raise_for_status()
+            index_data = response.json()
+            segment_index = index_data.get("segment_index", {})
+            if not segment_index:
+                self.logger.info(f"vid='{vid}' 没有找到弹幕分段索引。")
+                return []
+        except Exception as e:
+            self.logger.error(f"获取弹幕索引失败 (vid={vid}): {e}", exc_info=True)
+            return []
+
+        # 2. 创建所有分段的并发下载任务
+        total_segments = len(segment_index)
+        self.logger.info(f"为 vid='{vid}' 找到 {total_segments} 个弹幕分段，开始并发获取...")
+        if progress_callback:
+            await progress_callback(5, f"找到 {total_segments} 个弹幕分段")
+
+        tasks = []
+        # 按key（时间戳）排序，确保弹幕顺序正确
+        sorted_keys = sorted(segment_index.keys(), key=int)
+        for key in sorted_keys:
+            segment = segment_index[key]
+            segment_name = segment.get("segment_name")
+            if not segment_name:
                 continue
+            # 创建任务协程，但不立即执行
+            task = self._fetch_segment_comments(vid, segment_name)
+            tasks.append(task)
+        
+        # 3. 使用 asyncio.as_completed 执行任务并处理结果
+        completed_count = 0
+        for future in asyncio.as_completed(tasks):
+            # await 会等待下一个完成的任务，并返回其结果
+            segment_comments = await future
+            all_comments.extend(segment_comments)
+            
+            completed_count += 1
+            if progress_callback:
+                # 5%用于获取索引，90%用于下载，5%用于格式化
+                progress = 5 + int((completed_count / total_segments) * 90)
+                await progress_callback(progress, f"正在下载分段 {completed_count}/{total_segments}")
         
         if progress_callback:
             await progress_callback(100, "弹幕整合完成")
@@ -1066,7 +1077,7 @@ class TencentScraper(BaseScraper):
             
             try:
                 self.logger.debug(f"请求分集列表 (cid={cid}), PageContext='{page_context}'")
-                response = await self._request("POST", url, json=payload)
+                response = await self.client.post(url, json=payload)
                 response.raise_for_status()
                 data = response.json()
     

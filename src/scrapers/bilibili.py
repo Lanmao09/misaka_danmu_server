@@ -174,6 +174,8 @@ class BilibiliScraper(BaseScraper):
         self._api_lock = asyncio.Lock()
         self._last_request_time = 0
         self._min_interval = 0.5
+        # 我们的修改：为弹幕下载添加并发控制器
+        self.danmaku_semaphore = asyncio.Semaphore(5)
 
     async def _ensure_client(self):
         """Ensures the httpx client is initialized, with proxy support."""
@@ -319,6 +321,7 @@ class BilibiliScraper(BaseScraper):
 
         if poll_data.get("code") == 0:
             self.logger.info("Bilibili: 扫码登录成功！")
+            assert self.client is not None
             required_cookies = ["SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5", "sid"]
             all_cookies = []
             for name, value in self.client.cookies.items():
@@ -803,30 +806,55 @@ class BilibiliScraper(BaseScraper):
             self.logger.warning(f"Bilibili: 获取额外弹幕池失败 (aid={aid}, cid={cid}): {e}", exc_info=False)
         return list(all_cids)
 
-    async def _fetch_comments_for_cid(self, aid: int, cid: int, progress_callback: Optional[Callable] = None) -> List[DanmakuElem]:
-        """为单个CID获取所有弹幕分段。"""
-        all_comments = []
-        for segment_index in range(1, 100): # Limit to 100 segments to prevent infinite loops
+    async def _fetch_single_segment(self, aid: int, oid: int, segment_index: int) -> Optional[List[DanmakuElem]]:
+        """【新增】并发获取单个弹幕分段。"""
+        async with self.danmaku_semaphore:
             try:
-                if progress_callback:
-                    await progress_callback(min(95, segment_index * 10), f"获取弹幕池 {cid} 的分段 {segment_index}")
-
-                url = f"https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid={cid}&pid={aid}&segment_index={segment_index}"
-                response = await self._request_with_rate_limit("GET", url)
-                if response.status_code == 304 or not response.content: break
+                # 注意：此处不使用 self._request_with_rate_limit 避免锁竞争
+                assert self.client is not None
+                url = f"https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid={oid}&pid={aid}&segment_index={segment_index}"
+                response = await self.client.get(url)
+                if response.status_code in [304, 404] or not response.content:
+                    return None  # 表示分段结束或未找到
                 response.raise_for_status()
 
                 danmu_reply = DmSegMobileReply()
                 await asyncio.to_thread(danmu_reply.ParseFromString, response.content)
-                if not danmu_reply.elems: break
-                all_comments.extend(danmu_reply.elems)
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404: break
-                self.logger.error(f"Bilibili: 获取弹幕分段失败 (cid={cid}, segment={segment_index}): {e}", exc_info=True)
-                break
+                return list(danmu_reply.elems) if danmu_reply.elems else None
             except Exception as e:
-                self.logger.error(f"Bilibili: 处理弹幕分段时出错 (cid={cid}, segment={segment_index}): {e}", exc_info=True)
+                self.logger.error(f"Bilibili: 处理弹幕分段时出错 (oid={oid}, segment={segment_index}): {e}")
+                return None # 表示失败
+
+    async def _fetch_comments_for_cid(self, aid: int, cid: int, progress_callback: Optional[Callable] = None) -> List[DanmakuElem]:
+        """【重写】为单个CID以分批并发方式获取所有弹幕分段。"""
+        all_comments = []
+        current_segment = 1
+        batch_size = 10  # 每次并发10个分段
+        max_segments = 100 # 安全上限
+        
+        while current_segment < max_segments:
+            if progress_callback:
+                await progress_callback(min(95, current_segment), f"获取弹幕池 {cid} 的分段 {current_segment}-{current_segment + batch_size - 1}")
+            
+            tasks = [
+                self._fetch_single_segment(aid, cid, i)
+                for i in range(current_segment, current_segment + batch_size)
+            ]
+            results = await asyncio.gather(*tasks)
+
+            has_ended = False
+            for segment_result in results:
+                if segment_result is None:
+                    has_ended = True
+                    break
+                all_comments.extend(segment_result)
+            
+            if has_ended:
+                self.logger.info(f"Bilibili: CID {cid} 的弹幕分段已获取完毕。")
                 break
+                
+            current_segment += batch_size
+
         return all_comments
 
     async def get_comments(self, episode_id: str, progress_callback: Optional[Callable] = None) -> Optional[List[dict]]:
@@ -894,3 +922,4 @@ class BilibiliScraper(BaseScraper):
             p_string = f"{timestamp:.3f},{c.mode},{c.fontsize},{c.color},[{self.provider_name}]"
             formatted.append({"cid": str(c.id), "p": p_string, "m": sanitized_content, "t": round(timestamp, 2)})
         return formatted
+    
