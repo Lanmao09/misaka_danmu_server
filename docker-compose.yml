@@ -22,10 +22,10 @@ services:
       - DANMUAPI_SERVER__HOST=0.0.0.0
       - DANMUAPI_SERVER__PORT=7768
       # 数据库配置 - 连接到宿主机上的数据库
-      - DANMUAPI_DATABASE__HOST=127.0.0.1
+      - DANMUAPI_DATABASE__HOST=192.168.1.186
       - DANMUAPI_DATABASE__PORT=3306
       - DANMUAPI_DATABASE__USER=danmuapi
-      - DANMUAPI_DATABASE__PASSWORD=danmuapi
+      - DANMUAPI_DATABASE__PASSWORD=your_strong_user_password
       - DANMUAPI_DATABASE__NAME=danmuapi
       # 新增：日志级别配置 (可选值: DEBUG, INFO, WARNING, ERROR)
       # - DANMUAPI_LOG__LEVEL=DEBUG

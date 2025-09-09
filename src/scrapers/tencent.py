@@ -230,7 +230,7 @@ class TencentScraper(BaseScraper):
         # --- 为并发下载弹幕设置信号量，限制同时进行的请求数量 ---
         # 这是一个重要的实践，可以防止因请求过快被服务器屏蔽
         # 5 是一个非常安全且依然高效的并发数
-        self.danmaku_semaphore = asyncio.Semaphore(5)
+        self.danmaku_semaphore = asyncio.Semaphore(10)
 
     # Porting TITLE_MAPPING from JS
     _TITLE_MAPPING = {
