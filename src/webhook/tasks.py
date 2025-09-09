@@ -42,6 +42,7 @@ async def webhook_search_and_dispatch_task(
     bangumiId: Optional[str],
     webhookSource: str,
     year: Optional[int],
+    eventType: Optional[str],  # 新增：事件类型 (library.new, playback.start, ItemAdded, PlaybackStart)
     progress_callback: Callable,
     session: AsyncSession,
     manager: ScraperManager,
@@ -53,7 +54,19 @@ async def webhook_search_and_dispatch_task(
     Webhook 触发的后台任务：搜索所有源，找到最佳匹配，并为该匹配分发一个新的、具体的导入任务。
     """
     try:
-        logger.info(f"Webhook 任务: 开始为 '{animeTitle}' (S{season:02d}E{currentEpisodeIndex:02d}) 查找最佳源...")
+        # 根据事件类型决定下载策略
+        is_library_event = eventType in ["library.new", "ItemAdded"]
+        is_playback_event = eventType in ["playback.start", "PlaybackStart"]
+
+        if is_library_event:
+            # 入库事件：只下载当前集数
+            logger.info(f"Webhook 任务: 收到入库事件，开始为 '{animeTitle}' (S{season:02d}E{currentEpisodeIndex:02d}) 查找最佳源...")
+        elif is_playback_event and mediaType == "tv_series":
+            # 播放事件 + 电视剧：下载整部剧
+            logger.info(f"Webhook 任务: 收到播放事件，开始为 '{animeTitle}' (S{season:02d}) 查找最佳源，将下载整部剧...")
+        else:
+            # 播放事件 + 电影 或其他情况：下载当前集数
+            logger.info(f"Webhook 任务: 开始为 '{animeTitle}' (S{season:02d}E{currentEpisodeIndex:02d}) 查找最佳源...")
         progress_callback(5, "正在检查已收藏的源...")
 
         # 1. 优先查找已收藏的源
@@ -63,10 +76,18 @@ async def webhook_search_and_dispatch_task(
             progress_callback(10, f"找到已收藏的源: {favorited_source['providerName']}")
 
             # 直接使用这个源的信息创建导入任务
-            task_title = f"Webhook自动导入: {favorited_source['animeTitle']} ({favorited_source['providerName']})"
+            # 根据事件类型决定下载策略
+            if is_playback_event and mediaType == "tv_series":
+                # 播放事件 + 电视剧：下载整部剧
+                episode_index_to_use = None
+                task_title = f"Webhook自动导入: {favorited_source['animeTitle']} ({favorited_source['providerName']}) [整部剧]"
+            else:
+                # 入库事件 或 播放事件+电影：下载当前集数
+                episode_index_to_use = currentEpisodeIndex
+                task_title = f"Webhook自动导入: {favorited_source['animeTitle']} ({favorited_source['providerName']})"
             task_coro = lambda session, cb: generic_import_task(
                 provider=favorited_source['providerName'], mediaId=favorited_source['mediaId'], animeTitle=favorited_source['animeTitle'], year=year,
-                mediaType=favorited_source['mediaType'], season=season, currentEpisodeIndex=currentEpisodeIndex,
+                mediaType=favorited_source['mediaType'], season=season, currentEpisodeIndex=episode_index_to_use,
                 imageUrl=favorited_source['imageUrl'], doubanId=doubanId, tmdbId=tmdbId, imdbId=imdbId, tvdbId=tvdbId, metadata_manager=metadata_manager,
                 bangumiId=bangumiId, rate_limiter=rate_limiter,
                 progress_callback=cb, session=session, manager=manager,
@@ -116,19 +137,30 @@ async def webhook_search_and_dispatch_task(
         )
         best_match = valid_candidates[0]
 
-        logger.info(f"Webhook 任务: 在所有源中找到最佳匹配项 '{best_match.title}' (来自: {best_match.provider})，将为其创建导入任务。")
-        progress_callback(50, f"在 {best_match.provider} 中找到最佳匹配项")
+        if is_playback_event and mediaType == "tv_series":
+            logger.info(f"Webhook 任务: 在所有源中找到最佳匹配项 '{best_match.title}' (来自: {best_match.provider})，将为其创建整部剧导入任务。")
+            progress_callback(50, f"在 {best_match.provider} 中找到最佳匹配项，准备下载整部剧")
+        else:
+            logger.info(f"Webhook 任务: 在所有源中找到最佳匹配项 '{best_match.title}' (来自: {best_match.provider})，将为其创建导入任务。")
+            progress_callback(50, f"在 {best_match.provider} 中找到最佳匹配项")
 
-        # 根据媒体类型格式化任务标题，以包含季集信息和时间戳
+        # 根据事件类型和媒体类型格式化任务标题，以包含季集信息和时间戳
         current_time = get_now().strftime("%H:%M:%S")
-        if mediaType == "tv_series":
-            task_title = f"Webhook（{webhookSource}）自动导入：{best_match.title} - S{season:02d}E{currentEpisodeIndex:02d} ({best_match.provider}) [{current_time}]"
-        else: # movie
-            task_title = f"Webhook（{webhookSource}）自动导入：{best_match.title} ({best_match.provider}) [{current_time}]"
+        if is_playback_event and mediaType == "tv_series":
+            # 播放事件 + 电视剧：下载整部剧
+            episode_index_to_use = None
+            task_title = f"Webhook（{webhookSource}）自动导入：{best_match.title} - S{season:02d} [整部剧] ({best_match.provider}) [{current_time}]"
+        else:
+            # 入库事件 或 播放事件+电影：下载当前集数
+            episode_index_to_use = currentEpisodeIndex
+            if mediaType == "tv_series":
+                task_title = f"Webhook（{webhookSource}）自动导入：{best_match.title} - S{season:02d}E{currentEpisodeIndex:02d} ({best_match.provider}) [{current_time}]"
+            else: # movie
+                task_title = f"Webhook（{webhookSource}）自动导入：{best_match.title} ({best_match.provider}) [{current_time}]"
         task_coro = lambda session, cb: generic_import_task(
             provider=best_match.provider, mediaId=best_match.mediaId, year=year,
             animeTitle=best_match.title, mediaType=best_match.type,
-            season=season, currentEpisodeIndex=currentEpisodeIndex, imageUrl=best_match.imageUrl, metadata_manager=metadata_manager,
+            season=season, currentEpisodeIndex=episode_index_to_use, imageUrl=best_match.imageUrl, metadata_manager=metadata_manager,
             doubanId=doubanId, tmdbId=tmdbId, imdbId=imdbId, tvdbId=tvdbId, bangumiId=bangumiId, rate_limiter=rate_limiter,
             progress_callback=cb, session=session, manager=manager,  # 修正：使用由TaskManager提供的session和cb
             task_manager=task_manager

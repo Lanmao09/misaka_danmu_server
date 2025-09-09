@@ -112,23 +112,24 @@ class YoukuScraper(BaseScraper):
         self.year_reg = re.compile(r"[12][890][0-9][0-9]")
         self.unused_words_reg = re.compile(r"<[^>]+>|【.+?】")
 
-        self.client: Optional[httpx.AsyncClient] = None
+        self.client = httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"},
+            timeout=20.0,
+            follow_redirects=True
+        )
 
         # For danmaku signing
         self._cna = ""
         self._token = ""
-
-    async def _ensure_client(self):
-        """Ensures the httpx client is initialized, with proxy support."""
-        if self.client is None:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
-            # 修正：使用基类中的 _create_client 方法来创建客户端，以支持代理
-            self.client = await self._create_client(headers=headers, timeout=20.0, follow_redirects=True)
+        
+        # 新增：为弹幕下载添加并发控制器和令牌刷新锁
+        self.danmaku_semaphore = asyncio.Semaphore(5)
+        self._token_refresh_lock = asyncio.Lock()
 
     async def get_episode_blacklist_pattern(self) -> Optional[re.Pattern]:
         """
         获取并编译用于过滤分集的正则表达式。
-        此方法现在只使用数据库中配置的规则，如果规则为空，则不进行过滤。
+        此方法覆盖了基类中的方法，以确保对该源的正确回退逻辑。
         """
         # 1. 构造该源特定的配置键，确保与数据库键名一致
         provider_blacklist_key = f"{self.provider_name}_episode_blacklist_regex"
@@ -136,21 +137,28 @@ class YoukuScraper(BaseScraper):
         # 2. 从数据库动态获取用户自定义规则
         custom_blacklist_str = await self.config_manager.get(provider_blacklist_key)
 
-        # 3. 仅当用户配置了非空的规则时才进行过滤
+        final_blacklist_str = None
+        # 3. 优先使用用户自定义的、非空的规则
         if custom_blacklist_str and custom_blacklist_str.strip():
             self.logger.info(f"正在为 '{self.provider_name}' 使用数据库中的自定义分集黑名单。")
-            try:
-                return re.compile(custom_blacklist_str, re.IGNORECASE)
-            except re.error as e:
-                self.logger.error(f"编译 '{self.provider_name}' 的分集黑名单时出错: {e}。规则: '{custom_blacklist_str}'")
+            final_blacklist_str = custom_blacklist_str
+        # 4. 如果没有自定义规则，则回退到代码中内置的默认规则
+        elif self._PROVIDER_SPECIFIC_BLACKLIST_DEFAULT:
+            self.logger.info(f"正在为 '{self.provider_name}' 使用代码中内置的默认分集黑名单。")
+            final_blacklist_str = self._PROVIDER_SPECIFIC_BLACKLIST_DEFAULT
         
-        # 4. 如果规则为空或未配置，则不进行过滤
+        if final_blacklist_str:
+            try:
+                # 5. 编译正则表达式并返回
+                return re.compile(final_blacklist_str, re.IGNORECASE)
+            except re.error as e:
+                self.logger.error(f"编译 '{self.provider_name}' 的分集黑名单时出错: {e}。规则: '{final_blacklist_str}'")
+        
+        # 6. 如果没有任何规则，返回 None
         return None
 
     async def close(self):
-        if self.client:
-            await self.client.aclose()
-            self.client = None
+        await self.client.aclose()
 
     async def search(self, keyword: str, episode_info: Optional[Dict[str, Any]] = None) -> List[models.ProviderSearchInfo]:
         """
@@ -183,8 +191,6 @@ class YoukuScraper(BaseScraper):
 
     async def _perform_network_search(self, keyword: str, episode_info: Optional[Dict[str, Any]] = None) -> List[models.ProviderSearchInfo]:
         """Performs the actual network search for Youku."""
-        await self._ensure_client()
-        assert self.client is not None
         self.logger.info(f"Youku: 正在为 '{keyword}' 执行网络搜索...")
         ua_encoded = urlencode({"userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"})
         keyword_encoded = urlencode({"keyword": keyword})
@@ -243,8 +249,6 @@ class YoukuScraper(BaseScraper):
 
     async def get_info_from_url(self, url: str) -> Optional[models.ProviderSearchInfo]:
         """从优酷URL中提取作品信息。"""
-        await self._ensure_client()
-        assert self.client is not None
         self.logger.info(f"Youku: 正在从URL提取信息: {url}")
         
         try:
@@ -355,8 +359,6 @@ class YoukuScraper(BaseScraper):
         return provider_episodes
 
     async def _get_episodes_page(self, show_id: str, page: int, page_size: int) -> Optional[YoukuVideoResult]:
-        await self._ensure_client()
-        assert self.client is not None
         url = f"https://openapi.youku.com/v2/shows/videos.json?client_id=53e6cc67237fc59a&package=com.huawei.hwvplayer.youku&ext=show&show_id={show_id}&page={page}&count={page_size}"
         response = await self.client.get(url)
         if await self._should_log_responses():
@@ -365,12 +367,10 @@ class YoukuScraper(BaseScraper):
         return YoukuVideoResult.model_validate(response.json())
 
     async def get_comments(self, episode_id: str, progress_callback: Optional[Callable] = None) -> Optional[List[dict]]:
-        await self._ensure_client()
-        assert self.client is not None
         vid = episode_id.replace("_", "=")
         
         try:
-            await self._ensure_token_cookie() # 首次获取令牌
+            await self._ensure_token_cookie()
             
             episode_info_url = f"https://openapi.youku.com/v2/videos/show_basic.json?client_id=53e6cc67237fc59a&package=com.huawei.hwvplayer.youku&video_id={vid}"
             episode_info_resp = await self.client.get(episode_info_url)
@@ -382,81 +382,62 @@ class YoukuScraper(BaseScraper):
 
             if total_mat == 0:
                 self.logger.warning(f"Youku: Video {vid} has duration 0, no danmaku to fetch.")
-                return [] # 返回空列表表示成功但无内容
+                return []
 
+            tasks = [self._get_danmu_content_with_retry(vid, mat) for mat in range(total_mat)]
             all_comments = []
-            # 修正：使用 while 循环以支持重试
-            mat = 0
-            while mat < total_mat:
-                try:
-                    if progress_callback:
-                        progress = int((mat + 1) / total_mat * 100) if total_mat > 0 else 100
-                        await progress_callback(progress, f"正在获取分段 {mat + 1}/{total_mat}")
+            
+            completed_count = 0
+            for future in asyncio.as_completed(tasks):
+                comments_in_mat = await future
+                if comments_in_mat:
+                    all_comments.extend(comments_in_mat)
 
-                    comments_in_mat = await self._get_danmu_content_by_mat(vid, mat)
-                    if comments_in_mat:
-                        all_comments.extend(comments_in_mat)
-                    
-                    mat += 1 # 成功，处理下一段
-                    await asyncio.sleep(0.2)
-                except self.TokenExpiredError:
-                    self.logger.warning(f"Youku: 令牌已过期，正在强制刷新并重试分段 {mat + 1}...")
-                    await self._ensure_token_cookie(force_refresh=True)
-                    # 不增加 mat，以便重试当前分段
-                    continue
+                completed_count += 1
+                if progress_callback:
+                    progress = int((completed_count / total_mat) * 100) if total_mat > 0 else 100
+                    await progress_callback(progress, f"已处理分段 {completed_count}/{total_mat}")
 
             if progress_callback:
                 await progress_callback(100, "弹幕整合完成")
 
             return self._format_comments(all_comments)
 
-        except self.TokenExpiredError:
-            # 如果在循环外（例如第一次请求就失败且无法恢复）捕获到，则任务失败
-            self.logger.error(f"Youku: 无法获取有效令牌，任务失败 (vid: {vid})")
-            return None
         except Exception as e:
             self.logger.error(f"Youku: Failed to get danmaku for vid {vid}: {e}", exc_info=True)
-            return None # 返回 None 表示获取失败
+            return None
 
     async def _ensure_token_cookie(self, force_refresh: bool = False):
-        """
-        确保获取弹幕签名所需的 cna 和 _m_h5_tk cookie。
-        此逻辑严格参考了 C# 代码，并针对网络环境进行了优化。
-        """
-        # 步骤 1: 获取 'cna' cookie。它通常由优酷主站或其统计服务设置。
-        # 我们优先访问主站，因为它更不容易出网络问题。
-        cna_val = self.client.cookies.get("cna")
-        if not cna_val or force_refresh:
-            await self._ensure_client()
-            assert self.client is not None
-            try:
-                log_msg = "强制刷新 'cna' cookie..." if force_refresh else "'cna' cookie 未找到, 正在访问 youku.com 以获取..."
-                self.logger.debug(f"Youku: {log_msg}")
-                await self.client.get("https://www.youku.com/")
-                cna_val = self.client.cookies.get("cna")
-            except httpx.ConnectError as e:
-                self.logger.warning(f"Youku: 无法连接到 youku.com 获取 'cna' cookie。错误: {e}")
-        self._cna = cna_val or ""
+        async with self._token_refresh_lock:
+            # 再次检查，避免在等待锁的过程中，其他协程已经刷新了令牌
+            cna_val = self.client.cookies.get("cna")
+            token_val = self.client.cookies.get("_m_h5_tk")
+            if cna_val and token_val and not force_refresh:
+                self.logger.debug("Youku: 令牌有效，无需刷新。")
+                self._cna = cna_val
+                self._token = token_val.split("_")[0]
+                return
 
-        # 步骤 2: 获取 '_m_h5_tk' 令牌, 此请求可能依赖于 'cna' cookie 的存在。
-        token_val = self.client.cookies.get("_m_h5_tk")
-        if not token_val or force_refresh:
-            await self._ensure_client()
-            assert self.client is not None
             try:
-                log_msg = "强制刷新 '_m_h5_tk' cookie..." if force_refresh else "'_m_h5_tk' cookie 未找到, 正在从 acs.youku.com 请求..."
-                self.logger.debug(f"Youku: {log_msg}")
+                log_msg = "强制刷新 'cna' 和 '_m_h5_tk' cookie..." if force_refresh else "正在获取 'cna' 和 '_m_h5_tk' cookie..."
+                self.logger.info(f"Youku: {log_msg}")
+                await self.client.get("https://www.youku.com/")
                 await self.client.get("https://acs.youku.com/h5/mtop.com.youku.aplatform.weakget/1.0/?jsv=2.5.1&appKey=24679788")
+                
+                cna_val = self.client.cookies.get("cna")
                 token_val = self.client.cookies.get("_m_h5_tk")
-            except httpx.ConnectError as e:
-                self.logger.error(f"Youku: 无法连接到 acs.youku.com 获取令牌 cookie。弹幕获取很可能会失败。错误: {e}")
-        
-        self._token = token_val.split("_")[0] if token_val else ""
-        if self._token:
-            self.logger.info("Youku: 已成功获取/确认弹幕签名令牌。")
-        else:
-            self.logger.warning("Youku: 未能获取到弹幕签名所需的 token cookie (_m_h5_tk)，弹幕获取可能会失败。")
-            raise self.TokenExpiredError("无法获取有效的 _m_h5_tk 令牌。")
+                
+                self._cna = cna_val or ""
+                self._token = token_val.split("_")[0] if token_val else ""
+                
+                if self._token:
+                    self.logger.info("Youku: 已成功获取/刷新弹幕签名令牌。")
+                else:
+                    self.logger.error("Youku: 刷新后未能获取到弹幕签名令牌。")
+                    raise self.TokenExpiredError("刷新后无法获取有效的 _m_h5_tk 令牌。")
+            except Exception as e:
+                self.logger.error(f"Youku: 刷新令牌时发生网络错误: {e}")
+                raise self.TokenExpiredError(f"刷新令牌时发生网络错误: {e}")
 
     def _generate_msg_sign(self, msg_enc: str) -> str:
         s = msg_enc + "MkmC9SoIw6xCkSKHhJ7b5D2r51kBiREr"
@@ -466,12 +447,32 @@ class YoukuScraper(BaseScraper):
         s = "&".join([self._token, t, app_key, data])
         return hashlib.md5(s.encode('utf-8')).hexdigest().lower()
 
+    async def _get_danmu_content_with_retry(self, vid: str, mat: int) -> Optional[List[YoukuComment]]:
+        """【新增】包含令牌刷新和重试逻辑的单个分段获取器。"""
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                # 在每次尝试（包括重试）前，都要通过信号量
+                async with self.danmaku_semaphore:
+                    return await self._get_danmu_content_by_mat(vid, mat)
+            except self.TokenExpiredError:
+                self.logger.warning(f"Youku: 令牌过期 (vid={vid}, mat={mat}, 尝试 {attempt + 1}/{max_retries})，准备刷新...")
+                if attempt < max_retries - 1:
+                    try:
+                        await self._ensure_token_cookie(force_refresh=True)
+                    except self.TokenExpiredError:
+                        self.logger.error("Youku: 令牌刷新失败，放弃此分段。")
+                        return None # 刷新失败，不再重试
+                else:
+                    self.logger.error(f"Youku: 达到最大重试次数，放弃分段 (vid={vid}, mat={mat})。")
+            except Exception as e:
+                self.logger.error(f"Youku: 获取分段时发生未知错误 (vid={vid}, mat={mat}): {e}")
+                return None # 其他错误，不重试
+        return None
+
     async def _get_danmu_content_by_mat(self, vid: str, mat: int) -> Optional[List[YoukuComment]]:
-        await self._ensure_client()
-        assert self.client is not None
         if not self._token:
-            self.logger.error("Youku: Cannot get danmaku, _m_h5_tk is missing.")
-            return []
+            raise self.TokenExpiredError("Token is missing before request.")
 
         ctime = int(time.time() * 1000)
         msg = {
@@ -490,54 +491,40 @@ class YoukuScraper(BaseScraper):
         t = str(int(time.time() * 1000))
         
         params = {
-            "jsv": "2.7.0",
-            "appKey": app_key,
-            "t": t,
+            "jsv": "2.7.0", "appKey": app_key, "t": t,
             "sign": self._generate_token_sign(t, app_key, data_payload),
-            "api": "mopen.youku.danmu.list",
-            "v": "1.0",
-            "type": "originaljson",
-            "dataType": "jsonp",
-            "timeout": "20000",
-            "jsonpIncPrefix": "utility"
+            "api": "mopen.youku.danmu.list", "v": "1.0", "type": "originaljson",
+            "dataType": "jsonp", "timeout": "20000", "jsonpIncPrefix": "utility"
         }
         
         url = f"https://acs.youku.com/h5/mopen.youku.danmu.list/1.0/?{urlencode(params)}"
         
-        response = await self.client.post(
-            url,
-            data={"data": data_payload},
-            headers={"Referer": "https://v.youku.com"}
-        )
+        response = await self.client.post(url, data={"data": data_payload}, headers={"Referer": "https://v.youku.com"})
+        
         if await self._should_log_responses():
             scraper_responses_logger.debug(f"Youku Danmaku Segment Response (vid={vid}, mat={mat}): {response.text}")
         response.raise_for_status()
 
-        # 修正：优酷API现在直接返回JSON，而不是JSONP。
         try:
             rpc_result = YoukuRpcResult.model_validate(response.json())
         except (json.JSONDecodeError, ValidationError) as e:
             self.logger.error(f"Youku: 解析外层弹幕响应失败: {e} - 响应: {response.text[:200]}")
             return None
 
-        # 新增：检查API返回的错误信息
         if "SUCCESS" not in rpc_result.ret[0]:
             error_msg = rpc_result.ret[0]
             self.logger.warning(f"Youku API 错误 (vid={vid}, mat={mat}): {error_msg}")
-            if "TOKEN_EXOIRED" in error_msg: # 优酷API拼写错误
+            if "TOKEN_EXOIRED" in error_msg:
                 raise self.TokenExpiredError()
-            # 对于其他错误，例如 "ILLEGAL_ACCESS"，我们返回 None 表示此分段失败
             return None
 
-        # 只有在成功时才解析内层JSON
         if rpc_result.data and rpc_result.data.result:
             try:
                 comment_result = YoukuDanmakuResult.model_validate(json.loads(rpc_result.data.result))
-                if comment_result.data and comment_result.data.result:
-                    return comment_result.data.result
+                return comment_result.data.result if comment_result.data else []
             except (json.JSONDecodeError, ValidationError) as e:
                 self.logger.error(f"Youku: 解析内层弹幕结果字符串失败: {e}")
-        return None
+        return []
 
     def _format_comments(self, comments: List[YoukuComment]) -> List[dict]:
         if not comments:

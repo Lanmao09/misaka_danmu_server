@@ -52,8 +52,8 @@ class JellyfinWebhook(BaseWebhook):
 
         # 从这里开始，代码与之前相同，处理已解析的 payload
         event_type = payload.get("NotificationType")
-        if event_type not in ["ItemAdded"]:
-            logger.info(f"Webhook: 忽略非 'ItemAdded' 的事件 (类型: {event_type})")
+        if event_type not in ["ItemAdded", "PlaybackStart"]:
+            logger.info(f"Webhook: 忽略非 'ItemAdded' 或 'PlaybackStart' 的事件 (类型: {event_type})")
             return
 
         item_type = payload.get("ItemType")
@@ -87,7 +87,10 @@ class JellyfinWebhook(BaseWebhook):
                 return
 
             logger.info(f"Jellyfin Webhook: 解析到剧集 - 标题: '{series_title}', 类型: Episode, 季: {season_number}, 集: {episode_number}")
-            logger.info(f"Webhook: 收到剧集 '{series_title}' S{season_number:02d}E{episode_number:02d}' 的入库通知。")
+            if event_type == "ItemAdded":
+                logger.info(f"Webhook: 收到剧集 '{series_title}' S{season_number:02d}E{episode_number:02d}' 的入库通知，将下载该集弹幕。")
+            else:  # PlaybackStart
+                logger.info(f"Webhook: 收到剧集 '{series_title}' S{season_number:02d}E{episode_number:02d}' 的播放通知，将下载整部剧的弹幕。")
             
             task_title = f"Webhook（jellyfin）搜索: {series_title} - S{season_number:02d}E{episode_number:02d}"
             search_keyword = f"{series_title} S{season_number:02d}E{episode_number:02d}"
@@ -101,7 +104,10 @@ class JellyfinWebhook(BaseWebhook):
                 return
             
             logger.info(f"Jellyfin Webhook: 解析到电影 - 标题: '{movie_title}', 类型: Movie")
-            logger.info(f"Webhook: 收到电影 '{movie_title}' 的入库通知。")
+            if event_type == "ItemAdded":
+                logger.info(f"Webhook: 收到电影 '{movie_title}' 的入库通知。")
+            else:  # PlaybackStart
+                logger.info(f"Webhook: 收到电影 '{movie_title}' 的播放通知。")
             
             task_title = f"Webhook（jellyfin）搜索: {movie_title}"
             search_keyword = movie_title
@@ -127,6 +133,7 @@ class JellyfinWebhook(BaseWebhook):
             tvdbId=str(tvdb_id) if tvdb_id else None,
             bangumiId=str(bangumi_id) if bangumi_id else None,
             webhookSource='jellyfin',
+            eventType=event_type,  # 新增：传递事件类型
             progress_callback=callback,
             session=session,
             metadata_manager=self.metadata_manager,

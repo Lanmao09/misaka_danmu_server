@@ -19,9 +19,9 @@ class EmbyWebhook(BaseWebhook):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请求体不是有效的JSON。")
 
         event_type = payload.get("Event")
-        # 我们只关心新媒体入库的事件, 兼容 emby 的 'library.new' 和 jellyfin 的 'item.add'
-        if event_type not in ["library.new"]:
-            logger.info(f"Webhook: 忽略非 'item.add' 或 'library.new' 的事件 (类型: {event_type})")
+        # 我们关心入库和播放开始的事件
+        if event_type not in ["library.new", "playback.start"]:
+            logger.info(f"Webhook: 忽略非 'library.new' 或 'playback.start' 的事件 (类型: {event_type})")
             return
 
         item = payload.get("Item", {})
@@ -55,7 +55,10 @@ class EmbyWebhook(BaseWebhook):
                 return
 
             logger.info(f"Emby Webhook: 解析到剧集 - 标题: '{series_title}', 类型: Episode, 季: {season_number}, 集: {episode_number}")
-            logger.info(f"Webhook: 收到剧集 '{series_title}' S{season_number:02d}E{episode_number:02d}' 的入库通知。")
+            if event_type == "library.new":
+                logger.info(f"Webhook: 收到剧集 '{series_title}' S{season_number:02d}E{episode_number:02d}' 的入库通知，将下载该集弹幕。")
+            else:  # playback.start
+                logger.info(f"Webhook: 收到剧集 '{series_title}' S{season_number:02d}E{episode_number:02d}' 的播放通知，将下载整部剧的弹幕。")
             
             task_title = f"Webhook（emby）搜索: {series_title} - S{season_number:02d}E{episode_number:02d}"
             search_keyword = f"{series_title} S{season_number:02d}E{episode_number:02d}"
@@ -69,7 +72,10 @@ class EmbyWebhook(BaseWebhook):
                 return
             
             logger.info(f"Emby Webhook: 解析到电影 - 标题: '{movie_title}', 类型: Movie")
-            logger.info(f"Webhook: 收到电影 '{movie_title}' 的入库通知。")
+            if event_type == "library.new":
+                logger.info(f"Webhook: 收到电影 '{movie_title}' 的入库通知。")
+            else:  # playback.start
+                logger.info(f"Webhook: 收到电影 '{movie_title}' 的播放通知。")
             
             task_title = f"Webhook（emby）搜索: {movie_title}"
             search_keyword = movie_title
@@ -95,6 +101,7 @@ class EmbyWebhook(BaseWebhook):
             tvdbId=str(tvdb_id) if tvdb_id else None,
             bangumiId=str(bangumi_id) if bangumi_id else None,
             webhookSource='emby',
+            eventType=event_type,  # 新增：传递事件类型
             progress_callback=callback,
             session=session,
             metadata_manager=self.metadata_manager,
