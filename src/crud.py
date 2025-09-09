@@ -366,6 +366,37 @@ async def find_anime_by_title_and_season(session: AsyncSession, title: str, seas
     row = result.mappings().first()
     return dict(row) if row else None
 
+async def check_anime_has_danmaku(session: AsyncSession, title: str, season: int, episode_index: Optional[int] = None) -> bool:
+    """
+    检查指定动漫是否已有弹幕数据。
+    如果指定了 episode_index，则检查该集是否有弹幕；
+    如果未指定，则检查整部剧是否有任何弹幕。
+    """
+    # 首先查找动漫
+    anime = await find_anime_by_title_and_season(session, title, season)
+    if not anime:
+        return False
+
+    anime_id = anime["id"]
+
+    # 构建查询语句
+    stmt = (
+        select(Episode.commentCount)
+        .join(AnimeSource, Episode.sourceId == AnimeSource.id)
+        .where(AnimeSource.animeId == anime_id)
+    )
+
+    if episode_index is not None:
+        # 检查特定集数是否有弹幕
+        stmt = stmt.where(Episode.episodeIndex == episode_index, Episode.commentCount > 0)
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none() is not None
+    else:
+        # 检查整部剧是否有任何弹幕
+        stmt = stmt.where(Episode.commentCount > 0).limit(1)
+        result = await session.execute(stmt)
+        return result.scalar_one_or_none() is not None
+
 async def get_episode_indices_by_anime_title(session: AsyncSession, title: str, season: Optional[int] = None) -> List[int]:
     """根据作品标题和可选的季度号获取已存在的所有分集序号列表。"""
     stmt = (

@@ -78,7 +78,7 @@ export const Webhook = () => {
           <br />
           • <strong>入库触发</strong>：新媒体入库时下载当前集数弹幕
           <br />
-          • <strong>播放触发</strong>：播放电影时下载该电影弹幕，播放电视剧时下载整部剧所有集数的弹幕
+          • <strong>播放触发</strong>：智能检查弹幕库，只有在没有弹幕时才下载（电影下载该电影弹幕，电视剧下载整部剧弹幕）
         </div>
         <div className="mb-4">{`URL 格式为：http(s)://域名(ip):端口(port)/api/webhook/{服务名}?api_key={你的API Key}`}</div>
         <div className="flex items-center justify-start gap-3 mb-4">

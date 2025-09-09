@@ -58,14 +58,28 @@ async def webhook_search_and_dispatch_task(
         is_library_event = eventType in ["item.add", "library.new", "ItemAdded"]
         is_playback_event = eventType in ["playback.start", "PlaybackStart"]
 
-        if is_library_event:
-            # 入库事件：只下载当前集数
+        # 对于播放事件，检查是否已有弹幕，避免重复下载
+        if is_playback_event:
+            progress_callback(3, "正在检查弹幕库...")
+            if mediaType == "tv_series":
+                # 检查整部剧是否已有弹幕
+                has_danmaku = await crud.check_anime_has_danmaku(session, animeTitle, season)
+                if has_danmaku:
+                    logger.info(f"Webhook 任务: '{animeTitle}' (S{season:02d}) 已有弹幕数据，跳过下载。")
+                    raise TaskSuccess(f"'{animeTitle}' 已有弹幕数据，无需重复下载。")
+                logger.info(f"Webhook 任务: 收到播放事件，'{animeTitle}' (S{season:02d}) 暂无弹幕，开始查找最佳源下载整部剧...")
+            else:
+                # 检查当前集数是否已有弹幕
+                has_danmaku = await crud.check_anime_has_danmaku(session, animeTitle, season, currentEpisodeIndex)
+                if has_danmaku:
+                    logger.info(f"Webhook 任务: '{animeTitle}' (S{season:02d}E{currentEpisodeIndex:02d}) 已有弹幕数据，跳过下载。")
+                    raise TaskSuccess(f"'{animeTitle}' S{season:02d}E{currentEpisodeIndex:02d} 已有弹幕数据，无需重复下载。")
+                logger.info(f"Webhook 任务: 收到播放事件，'{animeTitle}' (S{season:02d}E{currentEpisodeIndex:02d}) 暂无弹幕，开始查找最佳源...")
+        elif is_library_event:
+            # 入库事件：总是下载当前集数（新入库的内容肯定没有弹幕）
             logger.info(f"Webhook 任务: 收到入库事件，开始为 '{animeTitle}' (S{season:02d}E{currentEpisodeIndex:02d}) 查找最佳源...")
-        elif is_playback_event and mediaType == "tv_series":
-            # 播放事件 + 电视剧：下载整部剧
-            logger.info(f"Webhook 任务: 收到播放事件，开始为 '{animeTitle}' (S{season:02d}) 查找最佳源，将下载整部剧...")
         else:
-            # 播放事件 + 电影 或其他情况：下载当前集数
+            # 其他情况：下载当前集数
             logger.info(f"Webhook 任务: 开始为 '{animeTitle}' (S{season:02d}E{currentEpisodeIndex:02d}) 查找最佳源...")
         progress_callback(5, "正在检查已收藏的源...")
 
