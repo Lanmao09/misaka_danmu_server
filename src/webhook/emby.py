@@ -20,8 +20,8 @@ class EmbyWebhook(BaseWebhook):
 
         event_type = payload.get("Event")
         # 我们关心入库和播放开始的事件
-        if event_type not in ["library.new", "playback.start"]:
-            logger.info(f"Webhook: 忽略非 'library.new' 或 'playback.start' 的事件 (类型: {event_type})")
+        if event_type not in ["item.add", "library.new", "playback.start"]:
+            logger.info(f"Webhook: 忽略非 'item.add', 'library.new' 或 'playback.start' 的事件 (类型: {event_type})")
             return
 
         item = payload.get("Item", {})
@@ -55,7 +55,7 @@ class EmbyWebhook(BaseWebhook):
                 return
 
             logger.info(f"Emby Webhook: 解析到剧集 - 标题: '{series_title}', 类型: Episode, 季: {season_number}, 集: {episode_number}")
-            if event_type == "library.new":
+            if event_type in ["item.add", "library.new"]:
                 logger.info(f"Webhook: 收到剧集 '{series_title}' S{season_number:02d}E{episode_number:02d}' 的入库通知，将下载该集弹幕。")
             else:  # playback.start
                 logger.info(f"Webhook: 收到剧集 '{series_title}' S{season_number:02d}E{episode_number:02d}' 的播放通知，将下载整部剧的弹幕。")
@@ -72,7 +72,7 @@ class EmbyWebhook(BaseWebhook):
                 return
             
             logger.info(f"Emby Webhook: 解析到电影 - 标题: '{movie_title}', 类型: Movie")
-            if event_type == "library.new":
+            if event_type in ["item.add", "library.new"]:
                 logger.info(f"Webhook: 收到电影 '{movie_title}' 的入库通知。")
             else:  # playback.start
                 logger.info(f"Webhook: 收到电影 '{movie_title}' 的播放通知。")

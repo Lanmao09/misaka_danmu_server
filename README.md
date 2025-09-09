@@ -301,6 +301,8 @@ networks:
   5. **关键步骤**: 在 **事件** (Events) 部分，请勾选以下事件：
      - **项目已添加 (Item Added)**: 新媒体入库时触发弹幕下载（下载当前集数）
      - **播放 > 开始 (Playback > Start)**: 媒体开始播放时触发弹幕下载（电视剧下载整部剧，电影下载当前集数）
+
+     **注意**: 某些 Emby 版本可能需要同时勾选 **"Item Added"** 和 **"Library New"** 事件以确保入库触发正常工作。
   6. 确保 **发送内容类型** (Content type) 设置为 `application/json`。
   7. 保存设置。
 - **对于Jellyfin**

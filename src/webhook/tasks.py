@@ -55,7 +55,7 @@ async def webhook_search_and_dispatch_task(
     """
     try:
         # 根据事件类型决定下载策略
-        is_library_event = eventType in ["library.new", "ItemAdded"]
+        is_library_event = eventType in ["item.add", "library.new", "ItemAdded"]
         is_playback_event = eventType in ["playback.start", "PlaybackStart"]
 
         if is_library_event:
