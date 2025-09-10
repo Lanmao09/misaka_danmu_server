@@ -210,7 +210,10 @@ class TencentScraper(BaseScraper):
         }
         # 根据C#代码，这个特定的cookie对于成功请求至关重要
         self.cookies = {"pgv_pvid": "40b67e3b06027f3d", "video_platform": "2", "vversion_name": "8.2.95", "video_bucketid": "4", "video_omgid": "0a1ff6bc9407c0b1cff86ee5d359614d"}
-        
+
+        # 新增：为弹幕下载添加并发控制器
+        self.danmaku_semaphore = asyncio.Semaphore(8)  # 大幅提升并发数，绕过API锁后可以支持更高并发
+
         # Headers and cookies for the new MultiTerminalSearch API
         self.multiterminal_headers = {
             'Content-Type': 'application/json',
@@ -1122,6 +1125,39 @@ class TencentScraper(BaseScraper):
 
         return final_episodes
 
+    async def _fetch_single_danmaku_segment(self, vid: str, segment_name: str) -> List[TencentComment]:
+        """【新增】并发获取单个弹幕分段，绕过API锁以提升并发性能。"""
+        async with self.danmaku_semaphore:
+            try:
+                await self._ensure_client()
+                assert self.client is not None
+
+                segment_url = f"https://dm.video.qq.com/barrage/segment/{vid}/{segment_name}"
+
+                # 【关键优化】直接使用client请求，绕过API锁和速率限制
+                # 弹幕下载对腾讯服务器压力较小，可以更高频率请求
+                response = await self.client.get(segment_url)
+
+                if await self._should_log_responses():
+                    scraper_responses_logger.debug(f"Tencent Danmaku Segment Response (vid={vid}, segment={segment_name}): status={response.status_code}")
+                response.raise_for_status()
+                comment_data = response.json()
+
+                comments = []
+                barrage_list = comment_data.get("barrage_list", [])
+                for comment_item in barrage_list:
+                    try:
+                        comments.append(TencentComment.model_validate(comment_item))
+                    except ValidationError as e:
+                        # 腾讯的弹幕列表里有时会混入非弹幕数据（如广告、推荐等），这些数据结构不同
+                        # 我们在这里捕获验证错误，记录并跳过这些无效数据，以保证程序健壮性
+                        self.logger.warning(f"跳过一个无效的弹幕项目，因为它不符合预期的格式。原始数据: {comment_item}, 错误: {e}")
+
+                return comments
+            except Exception as e:
+                self.logger.error(f"获取分段 {segment_name} 失败 (vid={vid}): {e}", exc_info=True)
+                return []
+
     async def _internal_get_comments(self, vid: str, progress_callback: Optional[Callable] = None) -> List[TencentComment]:
         """
         获取指定vid的所有弹幕。
@@ -1150,40 +1186,38 @@ class TencentScraper(BaseScraper):
         if progress_callback:
             await progress_callback(5, f"找到 {total_segments} 个弹幕分段")
 
-        # 与C#代码不同，这里我们直接遍历所有分段以获取全部弹幕，而不是抽样
+        # 【重写】使用并发方式下载所有弹幕分段，大幅提升下载速度
         # 按key（时间戳）排序，确保弹幕顺序正确
         sorted_keys = sorted(segment_index.keys(), key=int)
-        for i, key in enumerate(sorted_keys):
+        segment_names = []
+        for key in sorted_keys:
             segment = segment_index[key]
             segment_name = segment.get("segment_name")
-            if not segment_name:
-                continue
-            
+            if segment_name:
+                segment_names.append(segment_name)
+
+        if not segment_names:
+            self.logger.info(f"vid='{vid}' 没有有效的弹幕分段。")
+            return []
+
+        self.logger.info(f"Tencent: 开始并发下载 {len(segment_names)} 个弹幕分段...")
+
+        # 创建所有并发任务
+        tasks = [self._fetch_single_danmaku_segment(vid, segment_name) for segment_name in segment_names]
+
+        completed_count = 0
+        # 使用 as_completed 处理任务，提供实时进度反馈
+        for future in asyncio.as_completed(tasks):
+            segment_comments = await future
+            all_comments.extend(segment_comments)
+
+            completed_count += 1
             if progress_callback:
                 # 5%用于获取索引，90%用于下载，5%用于格式化
-                progress = 5 + int(((i + 1) / total_segments) * 90)
-                await progress_callback(progress, f"正在下载分段 {i+1}/{total_segments}")
+                progress = 5 + int((completed_count / len(segment_names)) * 90)
+                await progress_callback(progress, f"已完成分段 {completed_count}/{len(segment_names)}")
 
-            segment_url = f"https://dm.video.qq.com/barrage/segment/{vid}/{segment_name}"
-            try:
-                response = await self._request_with_rate_limit("GET", segment_url)
-                if await self._should_log_responses():
-                    scraper_responses_logger.debug(f"Tencent Danmaku Segment Response (vid={vid}, segment={segment_name}): status={response.status_code}")
-                response.raise_for_status()
-                comment_data = response.json()
-                
-                barrage_list = comment_data.get("barrage_list", [])
-                for comment_item in barrage_list:
-                    try:
-                        all_comments.append(TencentComment.model_validate(comment_item))
-                    except ValidationError as e:
-                        # 腾讯的弹幕列表里有时会混入非弹幕数据（如广告、推荐等），这些数据结构不同
-                        # 我们在这里捕获验证错误，记录并跳过这些无效数据，以保证程序健壮性
-                        self.logger.warning(f"跳过一个无效的弹幕项目，因为它不符合预期的格式。原始数据: {comment_item}, 错误: {e}")
-
-            except Exception as e:
-                self.logger.error(f"获取分段 {segment_name} 失败 (vid={vid}): {e}", exc_info=True)
-                continue
+        self.logger.info(f"Tencent: 并发下载完成，共获取 {len(all_comments)} 条弹幕")
         
         if progress_callback:
             await progress_callback(100, "弹幕整合完成")

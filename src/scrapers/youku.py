@@ -123,7 +123,7 @@ class YoukuScraper(BaseScraper):
         self._token = ""
         
         # 新增：为弹幕下载添加并发控制器和令牌刷新锁
-        self.danmaku_semaphore = asyncio.Semaphore(5)
+        self.danmaku_semaphore = asyncio.Semaphore(8)  # 提升并发数，优酷可以支持更高并发
         self._token_refresh_lock = asyncio.Lock()
 
     async def get_episode_blacklist_pattern(self) -> Optional[re.Pattern]:

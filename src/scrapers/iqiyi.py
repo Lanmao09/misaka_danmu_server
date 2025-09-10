@@ -277,7 +277,7 @@ class IqiyiScraper(BaseScraper):
             list(range(0xFDE0, 0xFFFD + 1))
          )
         # 新增：为弹幕下载添加并发控制器
-        self.danmaku_semaphore = asyncio.Semaphore(5)
+        self.danmaku_semaphore = asyncio.Semaphore(8)  # 提升并发数，爱奇艺可以支持更高并发
 
     async def get_episode_blacklist_pattern(self) -> Optional[re.Pattern]:
         """

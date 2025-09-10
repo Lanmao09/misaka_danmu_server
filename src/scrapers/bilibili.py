@@ -175,7 +175,7 @@ class BilibiliScraper(BaseScraper):
         self._last_request_time = 0
         self._min_interval = 0.5
         # 我们的修改：为弹幕下载添加并发控制器
-        self.danmaku_semaphore = asyncio.Semaphore(5)
+        self.danmaku_semaphore = asyncio.Semaphore(10)  # 提升并发数，B站服务器性能较好
 
     async def _ensure_client(self):
         """Ensures the httpx client is initialized, with proxy support."""
@@ -829,7 +829,7 @@ class BilibiliScraper(BaseScraper):
         """【重写】为单个CID以分批并发方式获取所有弹幕分段。"""
         all_comments = []
         current_segment = 1
-        batch_size = 10  # 每次并发10个分段
+        batch_size = 15  # 每次并发15个分段，提升下载速度
         max_segments = 100 # 安全上限
         
         while current_segment < max_segments:
