@@ -22,10 +22,224 @@ from .config import settings
 from .timezone import get_now
 from .danmaku_parser import parse_dandan_xml_to_comments
 
+# 全局配置管理器引用，在应用启动时设置
+_global_config_manager = None
+
+def set_global_config_manager(config_manager):
+    """设置全局配置管理器引用"""
+    global _global_config_manager
+    _global_config_manager = config_manager
+
+async def _get_danmaku_path_style() -> str:
+    """获取弹幕文件路径风格配置"""
+    if _global_config_manager:
+        try:
+            return await _global_config_manager.get("danmakuFilePathStyle", "emby")
+        except Exception:
+            logger.warning("获取弹幕文件路径风格配置失败，使用默认值 'emby'")
+    return "emby"
+
 logger = logging.getLogger(__name__)
 
 # --- 新增：文件存储相关常量和辅助函数 ---
-DANMAKU_BASE_DIR = Path(__file__).parent.parent / "config" / "danmaku"
+# 在 Docker 容器中使用绝对路径，在开发环境中使用相对路径
+if Path("/app").exists():
+    # Docker 容器环境
+    DANMAKU_BASE_DIR = Path("/app/config/danmaku")
+else:
+    # 开发环境
+    DANMAKU_BASE_DIR = Path(__file__).parent.parent / "config" / "danmaku"
+
+def _sanitize_filename(name: str) -> str:
+    """清理文件名，移除或替换不安全的字符"""
+    if not name:
+        return "Unknown"
+
+    # 替换不安全的文件系统字符
+    unsafe_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
+    sanitized = name
+    for char in unsafe_chars:
+        sanitized = sanitized.replace(char, '_')
+
+    # 移除前后空格和点号
+    sanitized = sanitized.strip(' .')
+
+    # 限制长度，避免路径过长
+    if len(sanitized) > 100:
+        sanitized = sanitized[:97] + "..."
+
+    return sanitized or "Unknown"
+
+def _build_emby_style_path(anime_title: str, anime_type: str, season: int, year: Optional[int],
+                          episode_index: int, episode_title: str, episode_id: int) -> tuple[str, Path]:
+    """
+    构建类似 Emby 的弹幕文件路径和文件名
+    返回 (web_path, absolute_path) 元组
+
+    目录结构示例:
+    - 电视剧: /danmaku/TV Shows/某科学的超电磁炮T (2020)/Season 1/S01E01_超电磁炮.xml
+    - 电影: /danmaku/Movies/你的名字 (2016)/你的名字.xml
+    - OVA: /danmaku/OVA/某科学的超电磁炮 OVA (2019)/OVA01_特别篇.xml
+    """
+    # 清理标题
+    clean_anime_title = _sanitize_filename(anime_title)
+    clean_episode_title = _sanitize_filename(episode_title)
+
+    # 构建作品目录名（包含年份）
+    if year:
+        anime_dir_name = f"{clean_anime_title} ({year})"
+    else:
+        anime_dir_name = clean_anime_title
+
+    # 根据类型构建路径
+    if anime_type == "movie":
+        # 电影: /danmaku/Movies/电影名 (年份)/电影名.xml
+        base_path = "Movies" / Path(anime_dir_name)
+        filename = f"{clean_anime_title}.xml"
+    elif anime_type == "ova":
+        # OVA: /danmaku/OVA/作品名 (年份)/OVA01_标题.xml
+        base_path = "OVA" / Path(anime_dir_name)
+        filename = f"OVA{episode_index:02d}_{clean_episode_title}.xml"
+    else:
+        # 电视剧: /danmaku/TV Shows/作品名 (年份)/Season X/S01E01_标题.xml
+        season_dir = f"Season {season}"
+        base_path = "TV Shows" / Path(anime_dir_name) / season_dir
+        filename = f"S{season:02d}E{episode_index:02d}_{clean_episode_title}.xml"
+
+    # 构建完整路径
+    web_path = f"/danmaku/{base_path}/{filename}"
+    absolute_path = DANMAKU_BASE_DIR / base_path / filename
+
+    return web_path, absolute_path
+
+async def migrate_danmaku_files_to_emby_style(session: AsyncSession, dry_run: bool = True) -> Dict[str, Any]:
+    """
+    将现有的弹幕文件迁移到 Emby 风格的目录结构
+
+    Args:
+        session: 数据库会话
+        dry_run: 是否为试运行模式（只检查，不实际移动文件）
+
+    Returns:
+        迁移结果统计信息
+    """
+    logger.info(f"开始弹幕文件迁移{'（试运行模式）' if dry_run else ''}...")
+
+    # 统计信息
+    stats = {
+        "total_episodes": 0,
+        "files_to_migrate": 0,
+        "files_migrated": 0,
+        "files_failed": 0,
+        "files_not_found": 0,
+        "files_already_emby_style": 0,
+        "errors": []
+    }
+
+    try:
+        # 获取所有有弹幕文件的分集
+        stmt = select(Episode, Anime).join(
+            AnimeSource, Episode.sourceId == AnimeSource.id
+        ).join(
+            Anime, AnimeSource.animeId == Anime.id
+        ).where(
+            Episode.danmakuFilePath.isnot(None),
+            Episode.danmakuFilePath != ""
+        )
+
+        result = await session.execute(stmt)
+        episodes_with_anime = result.all()
+        stats["total_episodes"] = len(episodes_with_anime)
+
+        for episode, anime in episodes_with_anime:
+            try:
+                # 检查当前文件路径
+                # 数据库中存储的可能是 Web 路径，需要转换为文件系统路径
+                current_path = _get_fs_path_from_web_path(episode.danmakuFilePath)
+                if not current_path:
+                    # 如果无法解析 Web 路径，尝试直接作为相对路径处理
+                    current_path = Path(episode.danmakuFilePath)
+                    if not current_path.is_absolute():
+                        current_path = DANMAKU_BASE_DIR / current_path
+
+                # 检查文件是否存在
+                if not current_path.exists():
+                    stats["files_not_found"] += 1
+                    logger.warning(f"弹幕文件不存在: {current_path}")
+                    continue
+
+                # 检查是否已经是 Emby 风格路径
+                path_parts = current_path.parts
+                if len(path_parts) >= 3 and path_parts[-3] in ["TV Shows", "Movies", "OVA"]:
+                    stats["files_already_emby_style"] += 1
+                    continue
+
+                # 构建新的 Emby 风格路径
+                # 获取动画元数据
+                season = 1  # 默认季度
+                if hasattr(anime, 'season') and anime.season:
+                    season = anime.season
+
+                year = None
+                if hasattr(anime, 'year') and anime.year:
+                    year = anime.year
+                elif hasattr(anime, 'airDate') and anime.airDate:
+                    year = anime.airDate.year
+
+                anime_type = getattr(anime, 'type', 'tv_series')
+                if anime_type not in ['movie', 'ova']:
+                    anime_type = 'tv_series'
+
+                # 构建新路径
+                web_path, new_absolute_path = _build_emby_style_path(
+                    anime_title=anime.title,
+                    anime_type=anime_type,
+                    season=season,
+                    year=year,
+                    episode_index=episode.episodeIndex,
+                    episode_title=episode.title,
+                    episode_id=episode.id
+                )
+
+                stats["files_to_migrate"] += 1
+
+                if not dry_run:
+                    # 创建目标目录
+                    new_absolute_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    # 移动文件
+                    import shutil
+                    shutil.move(str(current_path), str(new_absolute_path))
+
+                    # 更新数据库中的路径
+                    # 存储相对于 DANMAKU_BASE_DIR 的路径
+                    relative_path = new_absolute_path.relative_to(DANMAKU_BASE_DIR)
+                    episode.danmakuFilePath = str(relative_path)
+
+                    stats["files_migrated"] += 1
+                    logger.info(f"迁移成功: {current_path} -> {new_absolute_path}")
+                else:
+                    logger.info(f"[试运行] 将迁移: {current_path} -> {new_absolute_path}")
+
+            except Exception as e:
+                stats["files_failed"] += 1
+                error_msg = f"迁移分集 {episode.id} 失败: {str(e)}"
+                stats["errors"].append(error_msg)
+                logger.error(error_msg, exc_info=True)
+
+        if not dry_run:
+            await session.commit()
+            logger.info("弹幕文件迁移完成，数据库已更新")
+        else:
+            logger.info("试运行完成，未实际移动文件")
+
+    except Exception as e:
+        stats["errors"].append(f"迁移过程中发生错误: {str(e)}")
+        logger.error(f"弹幕文件迁移失败: {e}", exc_info=True)
+        if not dry_run:
+            await session.rollback()
+
+    return stats
 
 def _generate_xml_from_comments(
     comments: List[Dict[str, Any]], 
@@ -381,7 +595,9 @@ async def search_episodes_in_library(session: AsyncSession, anime_title: str, ep
 async def find_anime_by_title_and_season(session: AsyncSession, title: str, season: int) -> Optional[Dict[str, Any]]:
     """
     通过标题和季度查找番剧，返回一个简化的字典或None。
+    支持精确匹配和模糊匹配。
     """
+    # 1. 首先尝试精确匹配
     stmt = (
         select(
             Anime.id,
@@ -393,13 +609,82 @@ async def find_anime_by_title_and_season(session: AsyncSession, title: str, seas
     )
     result = await session.execute(stmt)
     row = result.mappings().first()
-    return dict(row) if row else None
+    if row:
+        logger.info(f"find_anime_by_title_and_season: 精确匹配找到 - 标题: '{row['title']}', 季度: {row['season']}")
+        return dict(row)
+
+    # 2. 如果精确匹配失败，尝试模糊匹配
+    logger.info(f"find_anime_by_title_and_season: 精确匹配失败，尝试模糊匹配 - 搜索: '{title}', 季度: {season}")
+
+    # 使用 LIKE 进行模糊匹配，同时考虑别名
+    stmt = (
+        select(
+            Anime.id,
+            Anime.title,
+            Anime.season
+        )
+        .join(AnimeAlias, Anime.id == AnimeAlias.animeId, isouter=True)
+        .where(
+            or_(
+                Anime.title.like(f"%{title}%"),
+                AnimeAlias.nameEn.like(f"%{title}%"),
+                AnimeAlias.nameJp.like(f"%{title}%"),
+                AnimeAlias.nameRomaji.like(f"%{title}%"),
+                AnimeAlias.aliasCn1.like(f"%{title}%"),
+                AnimeAlias.aliasCn2.like(f"%{title}%"),
+                AnimeAlias.aliasCn3.like(f"%{title}%")
+            ),
+            Anime.season == season
+        )
+        .order_by(func.length(Anime.title))  # 优先返回标题较短的（更可能是主要标题）
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    row = result.mappings().first()
+    if row:
+        logger.info(f"find_anime_by_title_and_season: 模糊匹配找到 - 标题: '{row['title']}', 季度: {row['season']}")
+        return dict(row)
+
+    # 3. 如果仍然没有找到，尝试忽略季度进行匹配（用于处理季度信息不准确的情况）
+    logger.info(f"find_anime_by_title_and_season: 模糊匹配失败，尝试忽略季度匹配")
+
+    stmt = (
+        select(
+            Anime.id,
+            Anime.title,
+            Anime.season
+        )
+        .join(AnimeAlias, Anime.id == AnimeAlias.animeId, isouter=True)
+        .where(
+            or_(
+                Anime.title.like(f"%{title}%"),
+                AnimeAlias.nameEn.like(f"%{title}%"),
+                AnimeAlias.nameJp.like(f"%{title}%"),
+                AnimeAlias.nameRomaji.like(f"%{title}%"),
+                AnimeAlias.aliasCn1.like(f"%{title}%"),
+                AnimeAlias.aliasCn2.like(f"%{title}%"),
+                AnimeAlias.aliasCn3.like(f"%{title}%")
+            )
+        )
+        .order_by(func.length(Anime.title))
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    row = result.mappings().first()
+    if row:
+        logger.info(f"find_anime_by_title_and_season: 忽略季度匹配找到 - 标题: '{row['title']}', 季度: {row['season']}")
+        return dict(row)
+
+    logger.info(f"find_anime_by_title_and_season: 所有匹配方式都失败 - 搜索: '{title}', 季度: {season}")
+    return None
 
 async def check_anime_has_danmaku(session: AsyncSession, title: str, season: int, episode_index: Optional[int] = None) -> bool:
     """
     检查指定动漫是否已有弹幕数据。
     如果指定了 episode_index，则检查该集是否有弹幕；
     如果未指定，则检查整部剧是否有任何弹幕。
+
+    修复：不仅检查 commentCount，还要验证弹幕文件是否真实存在。
     """
     # 首先查找动漫
     anime = await find_anime_by_title_and_season(session, title, season)
@@ -408,54 +693,42 @@ async def check_anime_has_danmaku(session: AsyncSession, title: str, season: int
 
     anime_id = anime["id"]
 
-    # 构建查询语句
+    # 构建查询语句，获取分集信息
     stmt = (
-        select(Episode.commentCount)
+        select(Episode.commentCount, Episode.danmakuFilePath)
         .join(AnimeSource, Episode.sourceId == AnimeSource.id)
         .where(AnimeSource.animeId == anime_id)
     )
 
     if episode_index is not None:
         # 检查特定集数是否有弹幕
-        stmt = stmt.where(Episode.episodeIndex == episode_index, Episode.commentCount > 0)
+        stmt = stmt.where(Episode.episodeIndex == episode_index)
         result = await session.execute(stmt)
-        return result.scalar_one_or_none() is not None
-    else:
-        # 检查整部剧是否有任何弹幕
-        stmt = stmt.where(Episode.commentCount > 0).limit(1)
-        result = await session.execute(stmt)
-        return result.scalar_one_or_none() is not None
+        episode_data = result.first()
 
-async def check_anime_has_danmaku(session: AsyncSession, title: str, season: int, episode_index: Optional[int] = None) -> bool:
-    """
-    检查指定动漫是否已有弹幕数据。
-    如果指定了 episode_index，则检查该集是否有弹幕；
-    如果未指定，则检查整部剧是否有任何弹幕。
-    """
-    # 首先查找动漫
-    anime = await find_anime_by_title_and_season(session, title, season)
-    if not anime:
+        if not episode_data or episode_data.commentCount <= 0:
+            return False
+
+        # 验证弹幕文件是否真实存在
+        if episode_data.danmakuFilePath:
+            fs_path = _get_fs_path_from_web_path(episode_data.danmakuFilePath)
+            if fs_path and fs_path.is_file():
+                return True
+
         return False
-
-    anime_id = anime["id"]
-
-    # 构建查询语句
-    stmt = (
-        select(Episode.commentCount)
-        .join(AnimeSource, Episode.sourceId == AnimeSource.id)
-        .where(AnimeSource.animeId == anime_id)
-    )
-
-    if episode_index is not None:
-        # 检查特定集数是否有弹幕
-        stmt = stmt.where(Episode.episodeIndex == episode_index, Episode.commentCount > 0)
-        result = await session.execute(stmt)
-        return result.scalar_one_or_none() is not None
     else:
         # 检查整部剧是否有任何弹幕
-        stmt = stmt.where(Episode.commentCount > 0).limit(1)
         result = await session.execute(stmt)
-        return result.scalar_one_or_none() is not None
+        episodes = result.all()
+
+        for episode_data in episodes:
+            if episode_data.commentCount > 0 and episode_data.danmakuFilePath:
+                # 验证弹幕文件是否真实存在
+                fs_path = _get_fs_path_from_web_path(episode_data.danmakuFilePath)
+                if fs_path and fs_path.is_file():
+                    return True
+
+        return False
 
 async def get_episode_indices_by_anime_title(session: AsyncSession, title: str, season: Optional[int] = None) -> List[int]:
     """根据作品标题和可选的季度号获取已存在的所有分集序号列表。"""
@@ -936,15 +1209,15 @@ async def save_danmaku_for_episode(
         return 0
 
     episode = await session.get(
-        Episode, 
-        episode_id, 
+        Episode,
+        episode_id,
         options=[selectinload(Episode.source).selectinload(AnimeSource.anime)]
     )
     if not episode:
         raise ValueError(f"找不到ID为 {episode_id} 的分集")
 
-    anime_id = episode.source.anime.id
-    source_id = episode.source.id
+    anime = episode.source.anime
+    anime_id = anime.id
 
     # 新增：获取原始弹幕服务器信息
     provider_name = episode.source.providerName
@@ -953,10 +1226,25 @@ async def save_danmaku_for_episode(
         "bilibili": "comment.bilibili.com"
     }
     xml_content = _generate_xml_from_comments(comments, episode_id, provider_name, chat_server_map.get(provider_name, "danmaku.misaka.org"))
-    
-    # 修正：统一文件路径结构，与 tasks.py 保持一致（不包含 source_id）
-    web_path = f"/danmaku/{anime_id}/{episode_id}.xml"
-    absolute_path = DANMAKU_BASE_DIR / str(anime_id) / f"{episode_id}.xml"
+
+    # 【新增】根据配置选择路径风格
+    path_style = await _get_danmaku_path_style()
+
+    if path_style == "emby":
+        # 使用 Emby 风格的路径构建
+        web_path, absolute_path = _build_emby_style_path(
+            anime_title=anime.title,
+            anime_type=anime.type,
+            season=anime.season,
+            year=anime.year,
+            episode_index=episode.episodeIndex,
+            episode_title=episode.title,
+            episode_id=episode_id
+        )
+    else:
+        # 使用简单的数字ID结构（原有方式）
+        web_path = f"/danmaku/{anime_id}/{episode_id}.xml"
+        absolute_path = DANMAKU_BASE_DIR / str(anime_id) / f"{episode_id}.xml"
     
     try:
         absolute_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1084,19 +1372,30 @@ async def clear_episode_comments(session: AsyncSession, episode_id: int):
     """Deletes the danmaku file for an episode and resets its count."""
     episode = await session.get(Episode, episode_id)
     if not episode:
+        logger.warning(f"尝试清除弹幕时，分集 {episode_id} 不存在")
         return
-    
+
     if episode.danmakuFilePath:
+        logger.info(f"清除分集 {episode_id} 的弹幕文件: {episode.danmakuFilePath}")
         fs_path = _get_fs_path_from_web_path(episode.danmakuFilePath)
-        if fs_path and fs_path.is_file():
+        if fs_path:
             try:
-                fs_path.unlink()
+                if fs_path.is_file():
+                    fs_path.unlink(missing_ok=True)
+                    logger.info(f"成功删除弹幕文件: {fs_path}")
+                else:
+                    logger.warning(f"弹幕文件不存在，跳过删除: {fs_path}")
             except OSError as e:
                 logger.error(f"删除弹幕文件失败: {fs_path}。错误: {e}")
-    
+        else:
+            logger.error(f"无法解析弹幕文件路径: {episode.danmakuFilePath}")
+    else:
+        logger.info(f"分集 {episode_id} 没有关联的弹幕文件")
+
     episode.danmakuFilePath = None
     episode.commentCount = 0
     await session.commit()
+    logger.info(f"已重置分集 {episode_id} 的弹幕信息")
 
 async def get_anime_full_details(session: AsyncSession, anime_id: int) -> Optional[Dict[str, Any]]:
     stmt = (
@@ -1157,14 +1456,31 @@ async def delete_episode(session: AsyncSession, episode_id: int) -> bool:
     """删除一个分集及其弹幕文件。"""
     episode = await session.get(Episode, episode_id)
     if episode:
+        logger.info(f"删除分集 {episode_id}: {episode.title}")
         if episode.danmakuFilePath:
+            logger.info(f"删除关联的弹幕文件: {episode.danmakuFilePath}")
             fs_path = _get_fs_path_from_web_path(episode.danmakuFilePath)
-            if fs_path and fs_path.is_file():
-                fs_path.unlink(missing_ok=True)
+            if fs_path:
+                try:
+                    if fs_path.is_file():
+                        fs_path.unlink(missing_ok=True)
+                        logger.info(f"成功删除弹幕文件: {fs_path}")
+                    else:
+                        logger.warning(f"弹幕文件不存在，跳过删除: {fs_path}")
+                except OSError as e:
+                    logger.error(f"删除弹幕文件失败: {fs_path}。错误: {e}")
+            else:
+                logger.error(f"无法解析弹幕文件路径: {episode.danmakuFilePath}")
+        else:
+            logger.info(f"分集 {episode_id} 没有关联的弹幕文件")
+
         await session.delete(episode)
         await session.commit()
+        logger.info(f"成功删除分集 {episode_id}")
         return True
-    return False
+    else:
+        logger.warning(f"尝试删除不存在的分集: {episode_id}")
+        return False
 
 async def reassociate_anime_sources(session: AsyncSession, source_anime_id: int, target_anime_id: int) -> bool:
     """

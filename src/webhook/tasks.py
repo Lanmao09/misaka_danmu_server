@@ -13,6 +13,7 @@ from ..task_manager import TaskManager, TaskSuccess
 from ..tasks import generic_import_task
 from ..utils import parse_search_keyword
 from ..timezone import get_now
+from .utils.enhanced_checker import check_danmaku_enhanced, has_useful_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -60,17 +61,45 @@ async def webhook_search_and_dispatch_task(
 
         # 对于播放事件，检查是否已有弹幕，避免重复下载
         if is_playback_event:
-            progress_callback(3, "正在检查弹幕库...")
+            await progress_callback(3, "正在检查弹幕库...")
             if mediaType == "tv_series":
-                # 检查整部剧是否已有弹幕
-                has_danmaku = await crud.check_anime_has_danmaku(session, animeTitle, season)
+                # 检查整部剧是否已有弹幕 - 使用增强的匹配逻辑
+                logger.info(f"Webhook 任务: 正在检查 '{animeTitle}' (S{season:02d}) 的弹幕数据...")
+                # 构建增强元数据
+                enhanced_metadata = {
+                    "tmdb_id": tmdbId,
+                    "imdb_id": imdbId,
+                    "tvdb_id": tvdbId,
+                    "douban_id": doubanId,
+                    "bangumi_id": bangumiId
+                }
+
+                # 使用增强弹幕检测（传递正确的集数信息）
+                has_danmaku = await check_danmaku_enhanced(
+                    session, animeTitle, season, currentEpisodeIndex, enhanced_metadata
+                )
+                logger.info(f"Webhook 任务: 弹幕检测结果 - '{animeTitle}' (S{season:02d}): {'有弹幕' if has_danmaku else '无弹幕'}")
                 if has_danmaku:
                     logger.info(f"Webhook 任务: '{animeTitle}' (S{season:02d}) 已有弹幕数据，跳过下载。")
                     raise TaskSuccess(f"'{animeTitle}' 已有弹幕数据，无需重复下载。")
                 logger.info(f"Webhook 任务: 收到播放事件，'{animeTitle}' (S{season:02d}) 暂无弹幕，开始查找最佳源下载整部剧...")
             else:
-                # 检查当前集数是否已有弹幕
-                has_danmaku = await crud.check_anime_has_danmaku(session, animeTitle, season, currentEpisodeIndex)
+                # 检查当前集数是否已有弹幕 - 使用增强的匹配逻辑
+                logger.info(f"Webhook 任务: 正在检查 '{animeTitle}' (S{season:02d}E{currentEpisodeIndex:02d}) 的弹幕数据...")
+                # 构建增强元数据
+                enhanced_metadata = {
+                    "tmdb_id": tmdbId,
+                    "imdb_id": imdbId,
+                    "tvdb_id": tvdbId,
+                    "douban_id": doubanId,
+                    "bangumi_id": bangumiId
+                }
+
+                # 使用增强弹幕检测
+                has_danmaku = await check_danmaku_enhanced(
+                    session, animeTitle, season, currentEpisodeIndex, enhanced_metadata
+                )
+                logger.info(f"Webhook 任务: 弹幕检测结果 - '{animeTitle}' (S{season:02d}E{currentEpisodeIndex:02d}): {'有弹幕' if has_danmaku else '无弹幕'}")
                 if has_danmaku:
                     logger.info(f"Webhook 任务: '{animeTitle}' (S{season:02d}E{currentEpisodeIndex:02d}) 已有弹幕数据，跳过下载。")
                     raise TaskSuccess(f"'{animeTitle}' S{season:02d}E{currentEpisodeIndex:02d} 已有弹幕数据，无需重复下载。")
@@ -81,7 +110,7 @@ async def webhook_search_and_dispatch_task(
         else:
             # 其他情况：下载当前集数
             logger.info(f"Webhook 任务: 开始为 '{animeTitle}' (S{season:02d}E{currentEpisodeIndex:02d}) 查找最佳源...")
-        progress_callback(5, "正在检查已收藏的源...")
+        await progress_callback(5, "正在检查已收藏的源...")
 
         # 1. 优先查找已收藏的源 (Favorited Source)
         # 步骤 1a: 首先通过标题和季度找到库中的作品
@@ -119,7 +148,7 @@ async def webhook_search_and_dispatch_task(
 
         # 2. 如果没有收藏源，则并发搜索所有启用的源
         logger.info(f"Webhook 任务: 未找到收藏源，开始并发搜索所有启用的源...")
-        progress_callback(20, "并发搜索所有源...")
+        await progress_callback(20, "并发搜索所有源...")
 
         # 关键修复：像UI一样，先解析搜索关键词，分离出纯标题
         parsed_keyword = parse_search_keyword(searchKeyword)
@@ -160,10 +189,10 @@ async def webhook_search_and_dispatch_task(
 
         if is_playback_event and mediaType == "tv_series":
             logger.info(f"Webhook 任务: 在所有源中找到最佳匹配项 '{best_match.title}' (来自: {best_match.provider})，将为其创建整部剧导入任务。")
-            progress_callback(50, f"在 {best_match.provider} 中找到最佳匹配项，准备下载整部剧")
+            await progress_callback(50, f"在 {best_match.provider} 中找到最佳匹配项，准备下载整部剧")
         else:
             logger.info(f"Webhook 任务: 在所有源中找到最佳匹配项 '{best_match.title}' (来自: {best_match.provider})，将为其创建导入任务。")
-            progress_callback(50, f"在 {best_match.provider} 中找到最佳匹配项")
+            await progress_callback(50, f"在 {best_match.provider} 中找到最佳匹配项")
 
         # 根据事件类型和媒体类型格式化任务标题，以包含季集信息和时间戳
         current_time = get_now().strftime("%H:%M:%S")
@@ -180,6 +209,7 @@ async def webhook_search_and_dispatch_task(
             else: # movie
                 task_title = f"Webhook（{webhookSource}）自动导入：{best_match.title} ({best_match.provider}) [{current_time}]"
             unique_key = f"import-{best_match.provider}-{best_match.mediaId}-ep{currentEpisodeIndex}"
+
         task_coro = lambda session, cb: generic_import_task(
             provider=best_match.provider, mediaId=best_match.mediaId, year=year,
             animeTitle=best_match.title, mediaType=best_match.type,
@@ -189,7 +219,7 @@ async def webhook_search_and_dispatch_task(
             task_manager=task_manager
         )
         await task_manager.submit_task(task_coro, task_title, unique_key=unique_key)
-        raise TaskSuccess(f"Webhook: 已为源 '{best_match.provider}' 创建导入任务。")
+        raise TaskSuccess(f"Webhook: 已为最佳匹配项 '{best_match.title}' 创建导入任务。")
     except TaskSuccess:
         raise
     except Exception as e:

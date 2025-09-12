@@ -160,15 +160,24 @@ def _convert_text_danmaku_to_xml(text_content: str) -> str:
 def _delete_danmaku_file(danmaku_file_path_str: Optional[str]):
     """根据数据库中存储的Web路径，安全地删除对应的弹幕文件。"""
     if not danmaku_file_path_str:
+        logger.debug("弹幕文件路径为空，跳过删除")
         return
+
+    logger.info(f"尝试删除弹幕文件: {danmaku_file_path_str}")
     try:
         # 修正：使用 crud 中的辅助函数来获取正确的文件系统路径
         fs_path = _get_fs_path_from_web_path(danmaku_file_path_str)
-        if fs_path and fs_path.is_file():
-            fs_path.unlink(missing_ok=True)
+        if fs_path:
+            if fs_path.is_file():
+                fs_path.unlink(missing_ok=True)
+                logger.info(f"成功删除弹幕文件: {fs_path}")
+            else:
+                logger.warning(f"弹幕文件不存在，跳过删除: {fs_path}")
+        else:
+            logger.error(f"无法解析弹幕文件路径: {danmaku_file_path_str}")
     except (ValueError, FileNotFoundError):
         # 如果路径无效或文件不存在，则忽略
-        pass
+        logger.warning(f"弹幕文件路径无效或文件不存在: {danmaku_file_path_str}")
     except Exception as e:
         logger.error(f"删除弹幕文件 '{danmaku_file_path_str}' 时出错: {e}", exc_info=True)
 
@@ -184,12 +193,64 @@ async def delete_anime_task(animeId: int, session: AsyncSession, progress_callba
             if not anime_exists:
                 raise TaskSuccess("作品未找到，无需删除。")
 
-            # 1. 删除关联的弹幕文件目录
-            await progress_callback(50, "正在删除关联的弹幕文件...")
-            anime_danmaku_dir = DANMAKU_BASE_DIR / str(animeId)
-            if anime_danmaku_dir.exists() and anime_danmaku_dir.is_dir():
-                shutil.rmtree(anime_danmaku_dir)
-                logger.info(f"已删除作品的弹幕目录: {anime_danmaku_dir}")
+            # 1. 删除关联的弹幕文件
+            await progress_callback(30, "正在删除关联的弹幕文件...")
+
+            # 获取所有关联的分集弹幕文件路径
+            episodes_to_delete_res = await session.execute(
+                select(orm_models.Episode.danmakuFilePath)
+                .join(orm_models.AnimeSource)
+                .where(orm_models.AnimeSource.animeId == animeId)
+            )
+
+            deleted_files = []
+            deleted_dirs = set()
+
+            for file_path in episodes_to_delete_res.scalars().all():
+                if file_path:
+                    fs_path = _get_fs_path_from_web_path(file_path)
+                    if fs_path and fs_path.is_file():
+                        try:
+                            # 记录父目录，稍后清理空目录
+                            deleted_dirs.add(fs_path.parent)
+                            fs_path.unlink(missing_ok=True)
+                            deleted_files.append(str(fs_path))
+                            logger.info(f"删除弹幕文件: {fs_path}")
+                        except OSError as e:
+                            logger.error(f"删除弹幕文件失败: {fs_path}。错误: {e}")
+
+            await progress_callback(60, "正在清理空目录...")
+
+            # 清理空的目录结构（从最深层开始）
+            for dir_path in sorted(deleted_dirs, key=lambda x: len(x.parts), reverse=True):
+                try:
+                    if dir_path.exists() and dir_path.is_dir():
+                        # 检查目录是否为空
+                        if not any(dir_path.iterdir()):
+                            dir_path.rmdir()
+                            logger.info(f"删除空目录: {dir_path}")
+                            # 继续向上检查父目录
+                            parent = dir_path.parent
+                            while parent != DANMAKU_BASE_DIR and parent.exists() and parent.is_dir():
+                                if not any(parent.iterdir()):
+                                    parent.rmdir()
+                                    logger.info(f"删除空父目录: {parent}")
+                                    parent = parent.parent
+                                else:
+                                    break
+                except OSError as e:
+                    logger.warning(f"清理目录失败: {dir_path}。错误: {e}")
+
+            # 同时也检查旧的数字ID目录（向后兼容）
+            old_anime_danmaku_dir = DANMAKU_BASE_DIR / str(animeId)
+            if old_anime_danmaku_dir.exists() and old_anime_danmaku_dir.is_dir():
+                try:
+                    shutil.rmtree(old_anime_danmaku_dir)
+                    logger.info(f"删除旧格式弹幕目录: {old_anime_danmaku_dir}")
+                except OSError as e:
+                    logger.warning(f"删除旧格式目录失败: {old_anime_danmaku_dir}。错误: {e}")
+
+            logger.info(f"作品删除：共删除 {len(deleted_files)} 个弹幕文件，清理了 {len(deleted_dirs)} 个目录")
 
             # 2. 删除作品本身 (数据库将通过级联删除所有关联记录)
             await progress_callback(90, "正在删除数据库记录...")
@@ -650,6 +711,13 @@ async def delete_bulk_sources_task(sourceIds: List[int], session: AsyncSession, 
         try:
             source = await session.get(orm_models.AnimeSource, sourceId)
             if source:
+                # 删除关联的弹幕文件
+                episodes_to_delete_res = await session.execute(
+                    select(orm_models.Episode.danmakuFilePath).where(orm_models.Episode.sourceId == sourceId)
+                )
+                for file_path in episodes_to_delete_res.scalars().all():
+                    _delete_danmaku_file(file_path)
+
                 await session.delete(source)
                 await session.commit()
                 deleted_count += 1

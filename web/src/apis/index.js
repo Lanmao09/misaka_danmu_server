@@ -188,6 +188,22 @@ export const getDanmuOutputAggregation = () =>
 export const setDanmuOutputAggregation = data =>
   api.put('/api/ui/config/danmaku_aggregation_enabled', data)
 
+/** 获取弹幕文件路径风格 */
+export const getDanmakuFilePathStyle = () =>
+  api.get('/api/ui/config/danmakuFilePathStyle')
+
+/** 设置弹幕文件路径风格 */
+export const setDanmakuFilePathStyle = data =>
+  api.put('/api/ui/config/danmakuFilePathStyle', data)
+
+/** 预览弹幕文件迁移 */
+export const previewDanmakuMigration = () =>
+  api.get('/api/ui/danmaku/migration/preview')
+
+/** 执行弹幕文件迁移 */
+export const executeDanmakuMigration = () =>
+  api.post('/api/ui/danmaku/migration/execute')
+
 /** ---------------------------------------------- webhook ----------------------------------------------*/
 /** 获取webhook apikey */
 export const getWebhookApikey = () => api.get('/api/ui/config/webhookApiKey')

@@ -81,6 +81,7 @@ async def lifespan(app: FastAPI):
         # 弹幕源
         'danmakuOutputLimitPerSource': ('-1', '单源弹幕输出总数限制。-1为无限制。'),
         'danmakuAggregationEnabled': ('true', '是否启用跨源弹幕聚合功能。'),
+        'danmakuFilePathStyle': ('emby', '弹幕文件路径风格。emby: 类似Emby的目录结构，simple: 简单的数字ID结构。'),
         'scraperVerificationEnabled': ('false', '是否启用搜索源签名验证。'),
         'bilibiliCookie': ('', '用于访问B站API的Cookie，特别是buvid3。'),
         'gamerCookie': ('', '用于访问巴哈姆特动画疯的Cookie。'),
@@ -93,6 +94,9 @@ async def lifespan(app: FastAPI):
     await app.state.config_manager.register_defaults(default_configs)
 
     # --- 新的初始化顺序以解决循环依赖 ---
+    # 0. 设置全局配置管理器引用，供 crud 模块使用
+    crud.set_global_config_manager(app.state.config_manager)
+
     # 1. 初始化元数据管理器，但暂时不传入 scraper_manager
     app.state.metadata_manager = MetadataSourceManager(session_factory, app.state.config_manager, None) # type: ignore
 

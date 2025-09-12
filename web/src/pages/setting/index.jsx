@@ -1,6 +1,7 @@
 import { Tabs } from 'antd'
 import { Security } from './components/Security'
 import { Webhook } from './components/Webhook'
+import { Danmaku } from './components/Danmaku'
 import { Bangumi } from './components/Bangumi'
 import { TMDB } from './components/TMDB'
 import { Douban } from './components/Douban'
@@ -31,6 +32,11 @@ export const Setting = () => {
           label: 'Webhook',
           key: 'webhook',
           children: <Webhook />,
+        },
+        {
+          label: '弹幕设置',
+          key: 'danmaku',
+          children: <Danmaku />,
         },
         {
           label: 'Bangumi配置',

@@ -1783,6 +1783,20 @@ async def delete_bulk_sources_task(source_ids: List[int], session: AsyncSession,
         try:
             source = await session.get(orm_models.AnimeSource, source_id)
             if source:
+                # 删除关联的弹幕文件
+                episodes_to_delete_res = await session.execute(
+                    select(orm_models.Episode.danmakuFilePath).where(orm_models.Episode.sourceId == source_id)
+                )
+                for file_path in episodes_to_delete_res.scalars().all():
+                    if file_path:
+                        fs_path = crud._get_fs_path_from_web_path(file_path)
+                        if fs_path and fs_path.is_file():
+                            try:
+                                fs_path.unlink(missing_ok=True)
+                                logger.info(f"删除弹幕文件: {fs_path}")
+                            except OSError as e:
+                                logger.error(f"删除弹幕文件失败: {fs_path}。错误: {e}")
+
                 await session.delete(source)
                 await session.commit()
                 deleted_count += 1
@@ -2432,3 +2446,32 @@ async def get_rate_limit_status(
         secondsUntilReset=seconds_until_reset,
         providers=provider_items
     )
+
+# 弹幕文件迁移相关端点
+class DanmakuMigrationStats(BaseModel):
+    total_episodes: int
+    files_to_migrate: int
+    files_migrated: int
+    files_failed: int
+    files_not_found: int
+    files_already_emby_style: int
+    errors: List[str]
+
+@router.get("/danmaku/migration/preview", response_model=DanmakuMigrationStats, summary="预览弹幕文件迁移")
+async def preview_danmaku_migration(
+    current_user: models.User = Depends(security.get_current_user),
+    session: AsyncSession = Depends(get_db_session)
+):
+    """预览将现有弹幕文件迁移到 Emby 风格目录结构的结果，不实际移动文件。"""
+    stats = await crud.migrate_danmaku_files_to_emby_style(session, dry_run=True)
+    return DanmakuMigrationStats(**stats)
+
+@router.post("/danmaku/migration/execute", response_model=DanmakuMigrationStats, summary="执行弹幕文件迁移")
+async def execute_danmaku_migration(
+    current_user: models.User = Depends(security.get_current_user),
+    session: AsyncSession = Depends(get_db_session)
+):
+    """执行弹幕文件迁移到 Emby 风格目录结构。"""
+    stats = await crud.migrate_danmaku_files_to_emby_style(session, dry_run=False)
+    logger.info(f"用户 '{current_user.username}' 执行了弹幕文件迁移。")
+    return DanmakuMigrationStats(**stats)

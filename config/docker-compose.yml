@@ -33,12 +33,6 @@ services:
       #- DANMUAPI_JWT__SECRET_KEY=${JWT_SECRET_KEY:-a_very_secret_key_that_should_be_changed_in_prod}
       # 初始管理员配置
       - DANMUAPI_ADMIN__INITIAL_USER=admin
-      # Emby 服务器配置 (用于获取增强的元数据信息)
-      # 请根据您的 Emby 服务器实际地址修改
-      # Emby 增强元数据配置（可选）
-      # 启用后可通过元数据ID进行更精确的弹幕匹配
-      # - EMBY_SERVER_URL=http://192.168.1.100:8096
-      # - EMBY_API_KEY=your_emby_api_key_here
     volumes:
       # 挂载 config 目录以持久化日志和配置文件。
       - /docker/danmu-api/config:/app/config
